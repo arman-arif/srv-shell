@@ -5055,7 +5055,7 @@ ask_dbadmin() {
   if [[ -z $OPT_TOOLS ]]; then
     OPT_TOOLS=$(ui_menu "Database tools" "Which web database tool?" \
       adminer    "Adminer — one file, MySQL/MariaDB + PostgreSQL (recommended)" \
-      phpmyadmin "phpMyAdmin — MySQL/MariaDB" \
+      phpmyadmin "phpMyAdmin — MySQL/MariaDB only (no PostgreSQL)" \
       both       "Both") || die "Cancelled."
   fi
   if [[ -z $OPT_TOOLS_HOST ]] && (( ! INTERACTIVE )); then
@@ -5279,6 +5279,12 @@ tools_show() {
   echo
   echo "  Then log in with a database user — sites' users work, or create an admin: srv tools db-user"
   echo "  (MariaDB/MySQL 'root' can't log in here: it only works from the server's own shell.)"
+  if [[ -f $TOOLS_DIR/adminer.php ]] && feat_has postgres; then
+    echo "  PostgreSQL: open Adminer, choose System \"PostgreSQL\", server localhost (admin login: srv tools db-user --pg)"
+  fi
+  if [[ ! -f $TOOLS_DIR/adminer.php ]] && feat_has postgres; then
+    warn "phpMyAdmin can't open PostgreSQL databases — add Adminer for them: srv tools install adminer"
+  fi
   if [[ $(cfg_get TOOLS_HOST _) == _ && -z $(cfg_get TOOLS_ALLOW) ]]; then
     warn "The tools are on plain HTTP and open to any IP — restrict them: srv tools allow \"<your IP>\""
   elif [[ $(cfg_get TOOLS_HOST _) != _ && $(site_get "$(cfg_get TOOLS_HOST)" SSL) != yes ]]; then

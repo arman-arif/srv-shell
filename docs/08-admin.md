@@ -133,6 +133,11 @@ sudo srv tools install adminer --host example.com --allow "203.0.113.7"
 sudo srv tools                         # URL(s), user, host, allowlist
 ```
 
+**Which tool for which database:** phpMyAdmin only works with MariaDB/MySQL.
+For PostgreSQL, use Adminer, which handles both. You can have both installed;
+`srv tools install adminer` adds Adminer without touching phpMyAdmin. Both are
+then linked from the tools URL (`…/adminer/` and `…/phpmyadmin/`).
+
 ### Logging in
 
 There are two logins:
@@ -147,6 +152,8 @@ There are two logins:
    sudo srv tools db-user --mysql      # creates/resets user srv_admin and prints its password
    sudo srv tools db-user --pg
    ```
+   In Adminer, pick **System: PostgreSQL** (or MySQL) and use `localhost` as
+   the server.
    The database `root` user can't log in through the tools: on the server it
    uses socket authentication, which is the safe default.
 
