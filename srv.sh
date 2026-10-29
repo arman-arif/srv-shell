@@ -39,7 +39,7 @@
 set -Eeuo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-SRV_VERSION="4.1.0"
+SRV_VERSION="4.2.0"
 SRV_DIR="/etc/srv"
 SRV_STATE="$SRV_DIR/installed.conf"     # installed features
 SRV_CFG="$SRV_DIR/srv.conf"             # global settings
@@ -80,7 +80,7 @@ MOD_OK=() MOD_FAIL=()
 NODE_LAST_MAJOR=""
 DB_ENG=""
 DEPLOY_SITE="" DEPLOY_NEW_REL="" DEPLOY_ACTIVATED=0 DEPLOY_MAINT_SET=0 DEPLOY_ENV_CREATED=0
-TOOLS_NEW_PASS="" OPT_TOOLS="" OPT_TOOLS_HOST="" OPT_TOOLS_FILE="" OPT_PYVER=""   # OPT_TOOLS_ALLOW: unset = not given
+TOOLS_NEW_PASS="" OPT_TOOLS="" OPT_TOOLS_HOST="" OPT_TOOLS_FILE="" OPT_TOOLS_PGWEB_FILE="" OPT_PYVER=""   # OPT_TOOLS_ALLOW: unset = not given
 
 # Answers collected by the ask_* functions, consumed by the mod_* functions
 OPT_TZ="" OPT_HOSTNAME="" OPT_SWAP="" OPT_USER="" OPT_USER_KEYS="no" OPT_USER_PASS=""
@@ -1889,7 +1889,7 @@ cmd_install() {
       redis-server)           f=redis ;;
       ufw)                    f=firewall ;;
       ssl|letsencrypt)        f=certbot ;;
-      adminer|phpmyadmin)     OPT_TOOLS=$f; f=dbadmin ;;
+      adminer|phpmyadmin|pgweb) OPT_TOOLS=$f; f=dbadmin ;;
       tools)                  f=dbadmin ;;
     esac
     in_list "$f" "${FEATURES[@]}" || die "Unknown feature: $f. Available: ${FEATURES[*]}"
@@ -5043,6 +5043,8 @@ TOOLS_DIR="$SRV_LIB/tools"            # downloaded software
 TOOLS_VAR="/var/lib/srv-tools"        # sessions, temp files
 TOOLS_HTPASSWD="/etc/nginx/srv-tools.htpasswd"
 TOOLS_CONF="/etc/nginx/srv-tools.conf"
+PGWEB_BIN="$TOOLS_DIR/pgweb"
+PGWEB_UNIT="/etc/systemd/system/srv-pgweb.service"
 
 tools_url() {
   local h scheme=http path; h=$(cfg_get TOOLS_HOST _); path=$(cfg_get TOOLS_PATH)
@@ -5051,13 +5053,18 @@ tools_url() {
   printf '%s://%s/%s/' "$scheme" "$h" "$path"
 }
 
+tools_pick() {   # sets OPT_TOOLS from a checklist
+  local pg=OFF; if feat_has postgres; then pg=ON; fi
+  OPT_TOOLS=$(ui_checklist "Database tools" "Which web database tools? (space = toggle)" \
+      adminer    "Adminer — MySQL/MariaDB + PostgreSQL, one PHP file (recommended)" ON \
+      phpmyadmin "phpMyAdmin — MySQL/MariaDB only" OFF \
+      pgweb      "pgweb — PostgreSQL only, a small fast app (no PHP needed)" "$pg" | tr '\n' ' ') || OPT_TOOLS=""
+  OPT_TOOLS=${OPT_TOOLS% }
+  [[ -n $OPT_TOOLS ]] || die "Cancelled — no tool selected."
+}
+
 ask_dbadmin() {
-  if [[ -z $OPT_TOOLS ]]; then
-    OPT_TOOLS=$(ui_menu "Database tools" "Which web database tool?" \
-      adminer    "Adminer — one file, MySQL/MariaDB + PostgreSQL (recommended)" \
-      phpmyadmin "phpMyAdmin — MySQL/MariaDB only (no PostgreSQL)" \
-      both       "Both") || die "Cancelled."
-  fi
+  if [[ -z $OPT_TOOLS ]]; then tools_pick; fi
   if [[ -z $OPT_TOOLS_HOST ]] && (( ! INTERACTIVE )); then
     die "Add --host <domain> to choose where the tools are served (or --host _ for the server IP)."
   fi
@@ -5131,9 +5138,107 @@ EOF
   ok "phpMyAdmin $ver installed"
 }
 
-tools_render() {   # web folder, PHP pool and the Nginx location
+# pgweb — a single Go binary for PostgreSQL, run as srv-tools on a local port
+# and proxied under the tools' secret path (same password and IP allowlist).
+tools_install_pgweb() {   # [zip or binary] — latest release from GitHub, or a local file
+  local file=${1:-} arch tmpd bin="" ver
+  case $(uname -m) in
+    x86_64|amd64)  arch=amd64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    *) err "pgweb has no Linux build for $(uname -m)"; return 1 ;;
+  esac
+  tmpd=$(mktemp -d "$TMP_DIR/pgweb.XXXXXX")
+  if [[ -n $file ]]; then
+    [[ -f $file ]] || { err "Not found: $file"; return 1; }
+    cp "$file" "$tmpd/pkg"
+  else
+    info "Downloading pgweb (linux/$arch)"
+    run curl -fsSL --max-time 180 -o "$tmpd/pkg" "https://github.com/sosedoff/pgweb/releases/latest/download/pgweb_linux_$arch.zip" \
+      || { err "Couldn't download pgweb from GitHub (offline? install from a file: srv tools install pgweb --file pgweb_linux_$arch.zip)"; return 1; }
+  fi
+  if [[ $(head -c 4 "$tmpd/pkg" | od -An -c | tr -d ' ') == '177ELF' ]]; then
+    bin="$tmpd/pkg"
+  else
+    command -v unzip >/dev/null 2>&1 || apt_install unzip || return 1
+    unzip -oq "$tmpd/pkg" -d "$tmpd/x" 2>>"$SRV_LOG" || { err "$(basename "${file:-pgweb.zip}") isn't a pgweb zip or binary"; return 1; }
+    bin=$(find "$tmpd/x" -type f -name 'pgweb*' -print -quit)
+  fi
+  [[ -n $bin ]] || { err "No pgweb binary found in the download"; return 1; }
+  chmod 755 "$bin"
+  ver=$("$bin" --version 2>/dev/null | awk '/^Pgweb/ {print $2; exit}') || ver=""
+  [[ -n $ver ]] || { err "The pgweb binary doesn't run on this server (wrong architecture?)"; return 1; }
+  install -m 755 -o root -g root "$bin" "$PGWEB_BIN.new" && mv -f "$PGWEB_BIN.new" "$PGWEB_BIN"
+  cfg_set TOOLS_PGWEB "${ver#v}"
+  if systemctl is-active --quiet srv-pgweb 2>/dev/null; then run systemctl restart srv-pgweb || true; fi
+  ok "pgweb ${ver#v} installed"
+}
+
+tools_pgweb_port() {   # → a free local port for pgweb (remembered)
+  local p; p=$(cfg_get PGWEB_PORT)
+  if [[ -n $p ]]; then printf '%s' "$p"; return 0; fi
+  for (( p = 8081; p < 8200; p++ )); do
+    if ! port_used_by_site "$p" && ! port_in_use "$p"; then cfg_set PGWEB_PORT "$p"; printf '%s' "$p"; return 0; fi
+  done
+  return 1
+}
+
+tools_render_pgweb() {   # systemd unit; started, restarted on change, or removed
+  local path=$1 port unit new
+  if [[ ! -x $PGWEB_BIN ]]; then
+    if [[ -f $PGWEB_UNIT ]]; then
+      systemctl disable --now srv-pgweb >>"$SRV_LOG" 2>&1 || true
+      rm -f "$PGWEB_UNIT"; systemctl daemon-reload || true
+    fi
+    return 0
+  fi
+  port=$(tools_pgweb_port) || { err "No free port for pgweb"; return 1; }
+  install -d -m 700 -o srv-tools -g srv-tools "$TOOLS_VAR/pgweb"
+  new=$(cat <<UNIT
+# Managed by srv — pgweb for PostgreSQL (srv tools)
+[Unit]
+Description=pgweb PostgreSQL web UI (srv tools)
+After=network.target
+
+[Service]
+User=srv-tools
+Group=srv-tools
+Environment=HOME=$TOOLS_VAR/pgweb
+WorkingDirectory=$TOOLS_VAR/pgweb
+ExecStart=$PGWEB_BIN --bind=127.0.0.1 --listen=$port --prefix=$path/pgweb --sessions --skip-open --no-ssh --idle-timeout=60
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=$TOOLS_VAR/pgweb
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+)
+  unit=$(cat "$PGWEB_UNIT" 2>/dev/null || true)
+  if [[ $new != "$unit" ]]; then
+    printf '%s\n' "$new" >"$PGWEB_UNIT"
+    run systemctl daemon-reload
+    run systemctl enable srv-pgweb >/dev/null 2>&1 || true
+    run systemctl restart srv-pgweb || { err "pgweb didn't start — see: journalctl -u srv-pgweb"; return 1; }
+  elif ! systemctl is-active --quiet srv-pgweb; then
+    run systemctl enable --now srv-pgweb || { err "pgweb didn't start — see: journalctl -u srv-pgweb"; return 1; }
+  fi
+}
+
+tools_render() {   # web folder, PHP pool, pgweb service and the Nginx location
   local path php allow ip
   path=$(cfg_get TOOLS_PATH); php=$(cfg_get TOOLS_PHP); allow=$(cfg_get TOOLS_ALLOW)
+  [[ $path =~ ^_srv-tools-[A-Za-z0-9-]{8,64}$ ]] || { err "TOOLS_PATH in $SRV_CFG must look like _srv-tools-<8–64 letters, digits or dashes> (now: '$path')"; return 1; }
   # Web folder — only the secret path exists, so nothing else is reachable
   install -d -m 755 "$TOOLS_WEB"
   find "$TOOLS_WEB" -mindepth 1 -maxdepth 1 -name '_srv-tools-*' ! -name "$path" -exec rm -rf {} + 2>/dev/null || true
@@ -5152,19 +5257,26 @@ tools_render() {   # web folder, PHP pool and the Nginx location
   else
     rm -f "${TOOLS_WEB:?}/${path:?}/phpmyadmin"
   fi
-  cat >"$TOOLS_WEB/$path/index.php" <<EOF
-<?php header('X-Robots-Tag: noindex'); ?><!doctype html><html><head><meta charset="utf-8"><title>Database tools</title>
+  if [[ -x $PGWEB_BIN ]]; then
+    links+='<li><a href="pgweb/">pgweb</a> — PostgreSQL (host localhost, port 5432)</li>'
+  fi
+  # A static start page, so the tools work without PHP (pgweb only)
+  rm -f "$TOOLS_WEB/$path/index.php"
+  cat >"$TOOLS_WEB/$path/index.html" <<HTML
+<!doctype html><html><head><meta charset="utf-8"><meta name="robots" content="noindex"><title>Database tools</title>
 <style>body{font-family:system-ui,sans-serif;margin:3rem;line-height:1.6}</style></head>
 <body><h1>Database tools</h1><ul>$links</ul><p>Log in with a database user and password (create an admin login with: srv tools db-user).</p></body></html>
-EOF
-  chmod 644 "$TOOLS_WEB/$path/index.php"
+HTML
+  chmod 644 "$TOOLS_WEB/$path/index.html"
 
-  # PHP-FPM pool, isolated from the sites
-  local f
+  # PHP-FPM pool, isolated from the sites — only while a PHP tool is installed
+  local f keep=""
+  if tools_has_php && [[ -n $php && -d /etc/php/$php ]]; then keep="/etc/php/$php/fpm/pool.d/srv-tools.conf"; fi
   for f in /etc/php/*/fpm/pool.d/srv-tools.conf; do
-    if [[ -f $f && $f != "/etc/php/$php/fpm/pool.d/srv-tools.conf" ]]; then rm -f "$f"; local ov=${f#/etc/php/}; ov=${ov%%/*}; run systemctl reload "php$ov-fpm" || true; fi
+    if [[ -f $f && $f != "$keep" ]]; then rm -f "$f"; local ov=${f#/etc/php/}; ov=${ov%%/*}; run systemctl reload "php$ov-fpm" || true; fi
   done
-  cat >"/etc/php/$php/fpm/pool.d/srv-tools.conf" <<EOF
+  if [[ -n $keep ]]; then
+    cat >"$keep" <<EOP
 ; Managed by srv — Adminer / phpMyAdmin (srv tools)
 [srv-tools]
 user = srv-tools
@@ -5185,16 +5297,19 @@ php_admin_value[post_max_size] = 256M
 php_admin_value[memory_limit] = 512M
 php_admin_value[max_execution_time] = 300
 php_admin_flag[expose_php] = off
-EOF
-  "/usr/sbin/php-fpm$php" -t >>"$SRV_LOG" 2>&1 || { err "PHP-FPM rejected the tools pool — see $SRV_LOG"; return 1; }
-  run systemctl reload "php$php-fpm" || return 1
+EOP
+    "/usr/sbin/php-fpm$php" -t >>"$SRV_LOG" 2>&1 || { err "PHP-FPM rejected the tools pool — see $SRV_LOG"; return 1; }
+    run systemctl reload "php$php-fpm" || return 1
+  fi
+
+  tools_render_pgweb "$path" || return 1
 
   # Nginx location (included by the host site, or by the default server)
   {
     echo "# Managed by srv — database tools (srv tools). Don't edit; use srv tools allow|password|host."
     echo "location ^~ /$path/ {"
     echo "    root $TOOLS_WEB;"
-    echo "    index index.php;"
+    echo "    index index.html index.php;"
     echo "    auth_basic \"Restricted\";"
     echo "    auth_basic_user_file $TOOLS_HTPASSWD;"
     if [[ -n $allow ]]; then
@@ -5206,14 +5321,33 @@ EOF
     echo "    add_header X-Robots-Tag \"noindex, nofollow\" always;"
     echo "    add_header X-Frame-Options \"SAMEORIGIN\" always;"
     echo "    add_header X-Content-Type-Options \"nosniff\" always;"
-    echo "    location ~ \\.php\$ {"
-    echo "        try_files \$uri =404;"
-    echo "        fastcgi_pass unix:/run/php/srv-tools.sock;"
-    echo "        include fastcgi_params;"
-    echo "        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;"
-    echo "        fastcgi_param HTTP_PROXY \"\";"
-    echo "        fastcgi_read_timeout 300s;"
-    echo "    }"
+    if [[ -n $keep ]]; then
+      echo "    location ~ \\.php\$ {"
+      echo "        try_files \$uri =404;"
+      echo "        fastcgi_pass unix:/run/php/srv-tools.sock;"
+      echo "        include fastcgi_params;"
+      echo "        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;"
+      echo "        fastcgi_param HTTP_PROXY \"\";"
+      echo "        fastcgi_read_timeout 300s;"
+      echo "    }"
+    else
+      echo "    location ~ \\.php\$ { return 404; }"
+    fi
+    if [[ -x $PGWEB_BIN ]]; then
+      # Same password and allowlist (inherited); pgweb itself only listens on localhost
+      echo "    location = /$path/pgweb { return 301 /$path/pgweb/; }"
+      echo "    location ^~ /$path/pgweb/ {"
+      echo "        proxy_pass http://127.0.0.1:$(cfg_get PGWEB_PORT);"
+      echo "        proxy_http_version 1.1;"
+      echo "        proxy_set_header Host \$host;"
+      echo "        proxy_set_header X-Real-IP \$remote_addr;"
+      echo "        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;"
+      echo "        proxy_set_header X-Forwarded-Proto \$scheme;"
+      echo "        proxy_set_header Authorization \"\";"
+      echo "        proxy_set_header Connection \"\";"
+      echo "        proxy_read_timeout 310s;"
+      echo "    }"
+    fi
     echo "}"
   } >"$TOOLS_CONF"
 }
@@ -5236,25 +5370,54 @@ tools_set_password() {
   TOOLS_NEW_PASS=$pass
 }
 
+tools_want() {   # normalise a tool choice → "adminer phpmyadmin pgweb" subset
+  local x out=""
+  for x in ${1:-adminer}; do
+    case $x in
+      both) out+=" adminer phpmyadmin" ;;
+      all)  out+=" adminer phpmyadmin pgweb" ;;
+      adminer|phpmyadmin|pgweb) out+=" $x" ;;
+    esac
+  done
+  printf '%s' "${out# }"
+}
+
+tools_feat_string() {
+  local -a tl=()
+  if [[ -f $TOOLS_DIR/adminer.php ]]; then tl+=(adminer); fi
+  if [[ -d $TOOLS_DIR/phpmyadmin ]]; then tl+=(phpmyadmin); fi
+  if [[ -x $PGWEB_BIN ]]; then tl+=(pgweb); fi
+  printf '%s on %s' "${tl[*]}" "$(cfg_get TOOLS_HOST _)"
+}
+
+tools_has_php() { [[ -f $TOOLS_DIR/adminer.php || -d $TOOLS_DIR/phpmyadmin ]]; }
+
 mod_dbadmin() {
   step "Installing the database tools"
-  local -a vers=(); mapfile -t vers < <(php_versions)
-  (( ${#vers[@]} )) || { err "PHP is required — run: srv install php"; return 1; }
-  local php; php=$(cfg_get TOOLS_PHP); if [[ -z $php || ! -d /etc/php/$php ]]; then php=$(cfg_get PHP_DEFAULT "${vers[-1]}"); fi
-  in_list "$php" "${vers[@]}" || php=${vers[-1]}
-  cfg_set TOOLS_PHP "$php"
-  local ext; for ext in mysql pgsql mbstring xml zip; do
-    if ! pkg_installed "php$php-$ext" && pkg_available "php$php-$ext"; then apt_install "php$php-$ext" || true; fi
-  done
+  local want; want=" $(tools_want "${OPT_TOOLS:-adminer}") "
+  if [[ $want == *" adminer "* || $want == *" phpmyadmin "* ]] || tools_has_php; then
+    local -a vers=(); mapfile -t vers < <(php_versions)
+    (( ${#vers[@]} )) || { err "Adminer and phpMyAdmin need PHP — run: srv install php (pgweb works without it)"; return 1; }
+    local php; php=$(cfg_get TOOLS_PHP); if [[ -z $php || ! -d /etc/php/$php ]]; then php=$(cfg_get PHP_DEFAULT "${vers[-1]}"); fi
+    in_list "$php" "${vers[@]}" || php=${vers[-1]}
+    cfg_set TOOLS_PHP "$php"
+    local ext; for ext in mysql pgsql mbstring xml zip; do
+      if ! pkg_installed "php$php-$ext" && pkg_available "php$php-$ext"; then apt_install "php$php-$ext" || true; fi
+    done
+  fi
+  if [[ $want == *" pgweb "* ]] && ! feat_has postgres; then
+    warn "PostgreSQL isn't installed on this server — pgweb can still connect to another PostgreSQL server"
+  fi
   if ! id srv-tools &>/dev/null; then
     run useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin srv-tools || return 1
   fi
   install -d -m 755 "$TOOLS_DIR"
   install -d -m 700 -o srv-tools -g srv-tools "$TOOLS_VAR" "$TOOLS_VAR/tmp" "$TOOLS_VAR/sessions"
-  local want=${OPT_TOOLS:-adminer} failed=0
-  if [[ $want == adminer || $want == both ]]; then tools_install_adminer || failed=1; fi
-  if [[ $want == phpmyadmin || $want == both ]]; then tools_install_pma "${OPT_TOOLS_FILE:-}" || failed=1; fi
-  if [[ ! -f $TOOLS_DIR/adminer.php && ! -d $TOOLS_DIR/phpmyadmin ]]; then err "No database tool could be installed"; return 1; fi
+  local failed=0
+  if [[ $want == *" adminer "* ]]; then tools_install_adminer || failed=1; fi
+  if [[ $want == *" phpmyadmin "* ]]; then tools_install_pma "${OPT_TOOLS_FILE:-}" || failed=1; fi
+  if [[ $want == *" pgweb "* ]]; then tools_install_pgweb "${OPT_TOOLS_PGWEB_FILE:-}" || failed=1; fi
+  if ! tools_has_php && [[ ! -x $PGWEB_BIN ]]; then err "No database tool could be installed"; return 1; fi
   if [[ -z $(cfg_get TOOLS_PATH) ]]; then cfg_set TOOLS_PATH "_srv-tools-$(openssl rand -hex 10)"; fi
   cfg_set TOOLS_HOST "${OPT_TOOLS_HOST:-$(cfg_get TOOLS_HOST _)}"
   if [[ -n ${OPT_TOOLS_ALLOW+x} ]]; then cfg_set TOOLS_ALLOW "$OPT_TOOLS_ALLOW"; fi
@@ -5263,7 +5426,7 @@ mod_dbadmin() {
   if [[ ! -s $TOOLS_HTPASSWD ]]; then tools_set_password || return 1; fi
   tools_render || return 1
   tools_apply_host || return 1
-  feat_set dbadmin "$( [[ -f $TOOLS_DIR/adminer.php ]] && echo adminer)$( [[ -d $TOOLS_DIR/phpmyadmin ]] && echo " phpmyadmin") on $(cfg_get TOOLS_HOST _)"
+  feat_set dbadmin "$(tools_feat_string)"
   ok "Database tools ready"
   tools_show
   if (( failed )); then warn "Some tools failed to install — see above"; fi
@@ -5275,15 +5438,19 @@ tools_show() {
   printf '  %-12s %s\n' "URL" "$(tools_url)" "Login" "$(cfg_get TOOLS_USER admin)  $( [[ -n ${TOOLS_NEW_PASS:-} ]] && echo "/ $TOOLS_NEW_PASS   ← shown once" || echo "(reset with: srv tools password)")" \
     "Allowed IPs" "$(x=$(cfg_get TOOLS_ALLOW); echo "${x:-any}")" \
     "Adminer" "$(x=$(cfg_get TOOLS_ADMINER); [[ -f $TOOLS_DIR/adminer.php ]] && echo "${x:-installed}" || echo "not installed")" \
-    "phpMyAdmin" "$(x=$(cfg_get TOOLS_PMA); [[ -d $TOOLS_DIR/phpmyadmin ]] && echo "${x:-installed}" || echo "not installed")"
+    "phpMyAdmin" "$(x=$(cfg_get TOOLS_PMA); [[ -d $TOOLS_DIR/phpmyadmin ]] && echo "${x:-installed}" || echo "not installed")" \
+    "pgweb" "$(x=$(cfg_get TOOLS_PGWEB); [[ -x $PGWEB_BIN ]] && echo "${x:-installed} ($(systemctl is-active srv-pgweb 2>/dev/null || true), port $(cfg_get PGWEB_PORT))" || echo "not installed")"
   echo
   echo "  Then log in with a database user — sites' users work, or create an admin: srv tools db-user"
   echo "  (MariaDB/MySQL 'root' can't log in here: it only works from the server's own shell.)"
-  if [[ -f $TOOLS_DIR/adminer.php ]] && feat_has postgres; then
-    echo "  PostgreSQL: open Adminer, choose System \"PostgreSQL\", server localhost (admin login: srv tools db-user --pg)"
+  if [[ -x $PGWEB_BIN ]]; then
+    echo "  pgweb: host localhost, port $(pg_port), your database user (admin login: srv tools db-user --pg)"
   fi
-  if [[ ! -f $TOOLS_DIR/adminer.php ]] && feat_has postgres; then
-    warn "phpMyAdmin can't open PostgreSQL databases — add Adminer for them: srv tools install adminer"
+  if [[ -f $TOOLS_DIR/adminer.php ]] && feat_has postgres; then
+    echo "  Adminer + PostgreSQL: choose System \"PostgreSQL\", server localhost"
+  fi
+  if [[ ! -f $TOOLS_DIR/adminer.php && ! -x $PGWEB_BIN ]] && feat_has postgres; then
+    warn "phpMyAdmin can't open PostgreSQL databases — add a tool for them: srv tools install pgweb (or adminer)"
   fi
   if [[ $(cfg_get TOOLS_HOST _) == _ && -z $(cfg_get TOOLS_ALLOW) ]]; then
     warn "The tools are on plain HTTP and open to any IP — restrict them: srv tools allow \"<your IP>\""
@@ -5317,10 +5484,36 @@ SQL
   ok "$(eng_label "$DB_ENG") login for the tools: $u / $pass   (server: localhost)"
 }
 
-tools_remove() {
+tools_remove() {   # [adminer|phpmyadmin|pgweb] — one tool, or everything
   feat_has dbadmin || die "The database tools aren't installed."
-  if (( ! ASSUME_YES )); then ui_yesno "Remove Adminer / phpMyAdmin from this server?" no || die "Cancelled."; fi
+  local one=${1:-}
+  if [[ -n $one ]]; then
+    case $one in
+      adminer)    [[ -f $TOOLS_DIR/adminer.php ]] || die "Adminer isn't installed." ;;
+      phpmyadmin) [[ -d $TOOLS_DIR/phpmyadmin ]] || die "phpMyAdmin isn't installed." ;;
+      pgweb)      [[ -x $PGWEB_BIN ]] || die "pgweb isn't installed." ;;
+      *) die "Usage: srv tools remove [adminer|phpmyadmin|pgweb]" ;;
+    esac
+    local left=0
+    if [[ $one != adminer && -f $TOOLS_DIR/adminer.php ]]; then left=1; fi
+    if [[ $one != phpmyadmin && -d $TOOLS_DIR/phpmyadmin ]]; then left=1; fi
+    if [[ $one != pgweb && -x $PGWEB_BIN ]]; then left=1; fi
+    if (( left )); then
+      if (( ! ASSUME_YES )); then ui_yesno "Remove $one from the database tools?" yes || die "Cancelled."; fi
+      case $one in
+        adminer)    rm -f "${TOOLS_DIR:?}/adminer.php"; cfg_set TOOLS_ADMINER "" ;;
+        phpmyadmin) rm -rf "${TOOLS_DIR:?}/phpmyadmin"; cfg_set TOOLS_PMA "" ;;
+        pgweb)      rm -f "${PGWEB_BIN:?}"; cfg_set TOOLS_PGWEB "" ;;
+      esac
+      tools_render && tools_apply_host || die "Updating the tools config failed — see $SRV_LOG"
+      feat_set dbadmin "$(tools_feat_string)"
+      ok "$one removed — the other tools stay"
+      return 0
+    fi
+  fi
+  if (( ! ASSUME_YES )); then ui_yesno "Remove all database tools (Adminer, phpMyAdmin, pgweb) from this server?" no || die "Cancelled."; fi
   local php; php=$(cfg_get TOOLS_PHP)
+  if [[ -f $PGWEB_UNIT ]]; then systemctl disable --now srv-pgweb >>"$SRV_LOG" 2>&1 || true; rm -f "$PGWEB_UNIT"; systemctl daemon-reload || true; fi
   rm -f "$TOOLS_CONF" "$TOOLS_HTPASSWD" "/etc/php/$php/fpm/pool.d/srv-tools.conf"
   rm -rf "${TOOLS_WEB:?}" "${TOOLS_DIR:?}"
   kv_del "$SRV_STATE" dbadmin
@@ -5338,15 +5531,20 @@ cmd_tools() {
       local t="" file=""
       while (( $# )); do
         case $1 in
-          adminer|phpmyadmin|both) t=$1; shift ;;
+          adminer|phpmyadmin|pgweb|both|all) t="${t:+$t }$1"; shift ;;
           --file) need_val "$@"; file=$2; shift 2 ;;
           --host) need_val "$@"; OPT_TOOLS_HOST=$2; shift 2 ;;
           --allow) need_val "$@"; OPT_TOOLS_ALLOW=$2; shift 2 ;;
-          *) die "Usage: srv tools install [adminer|phpmyadmin|both] [--host <domain|_>] [--allow \"ips\"] [--file pma.tar.gz]" ;;
+          *) die "Usage: srv tools install [adminer|phpmyadmin|pgweb|both|all] [--host <domain|_>] [--allow \"ips\"] [--file phpMyAdmin.tar.gz|pgweb.zip]" ;;
         esac
       done
-      if [[ -n $t ]]; then OPT_TOOLS=$t; fi   # installs just that tool; an installed other one stays
-      OPT_TOOLS_FILE=$file
+      if [[ -z $t ]] && feat_has dbadmin; then
+        (( INTERACTIVE )) || die "Name the tool to add: srv tools install adminer|phpmyadmin|pgweb"
+        tools_pick; t=$OPT_TOOLS
+      fi
+      if [[ -n $t ]]; then OPT_TOOLS=$t; fi   # installs just those tools; installed other ones stay
+      if [[ -n $file && " $(tools_want "$t") " == *" pgweb "* && " $(tools_want "$t") " != *" phpmyadmin "* ]]; then OPT_TOOLS_PGWEB_FILE=$file
+      else OPT_TOOLS_FILE=$file; fi
       if [[ -n $OPT_TOOLS_HOST && $OPT_TOOLS_HOST != _ ]]; then site_exists "$OPT_TOOLS_HOST" || die "Site not found: $OPT_TOOLS_HOST"; fi
       if ! feat_has dbadmin; then ask_dbadmin; fi
       if ! feat_has base; then try mod_base; fi
@@ -5356,6 +5554,7 @@ cmd_tools() {
       feat_has dbadmin || die "The database tools aren't installed."
       if [[ -f $TOOLS_DIR/adminer.php ]]; then tools_install_adminer || warn "Adminer update failed"; fi
       if [[ -d $TOOLS_DIR/phpmyadmin ]]; then tools_install_pma "${1:-}" || warn "phpMyAdmin update failed"; fi
+      if [[ -x $PGWEB_BIN ]]; then tools_install_pgweb || warn "pgweb update failed"; fi
       tools_render && tools_apply_host ;;
     password|passwd)
       feat_has dbadmin || die "The database tools aren't installed."
@@ -5374,14 +5573,15 @@ cmd_tools() {
       local h=${1:-}; [[ -n $h ]] || die "Usage: srv tools host <domain|_>"
       if [[ $h != _ ]]; then site_exists "$h" || die "Site not found: $h"; fi
       local old; old=$(cfg_get TOOLS_HOST _)
+      tools_render || die "Updating the tools config failed — see $SRV_LOG"
       cfg_set TOOLS_HOST "$h"
       if [[ $old == _ ]]; then nginx_write_default && nginx_reload; elif site_exists "$old"; then site_apply_nginx "$old"; fi
       tools_apply_host
-      feat_set dbadmin "$(feat_get dbadmin | sed 's/ on .*//') on $h"
+      feat_set dbadmin "$(tools_feat_string)"
       ok "Database tools moved to $(tools_url)" ;;
     db-user)  tools_db_user "$@" ;;
-    remove|uninstall) tools_remove ;;
-    *) die "Usage: srv tools status|install|update|password|allow \"ips\"|host <domain>|db-user|remove" ;;
+    remove|uninstall) tools_remove "${1:-}" ;;
+    *) die "Usage: srv tools status|install [tool]|update|password|allow \"ips\"|host <domain>|db-user|remove [tool]" ;;
   esac
 }
 
@@ -5565,6 +5765,7 @@ run_checks() {
   if feat_has redis; then svcs+=(redis-server); fi
   if feat_has supervisor; then svcs+=(supervisor); fi
   if feat_has webhook; then svcs+=(srv-webhook); fi
+  if [[ -x $PGWEB_BIN ]]; then svcs+=(srv-pgweb); fi
   if feat_has fail2ban; then svcs+=(fail2ban); fi
   svcs+=(cron)
   for s in "${svcs[@]}"; do
@@ -6661,6 +6862,7 @@ cmd_status() {
     fi
   done < <(site_list_domains)
   if feat_has webhook; then svc_row srv-webhook; fi
+  if [[ -x $PGWEB_BIN ]]; then svc_row srv-pgweb; fi
   if feat_has fail2ban; then svc_row fail2ban; fi
   if feat_has certbot; then svc_row certbot.timer; fi
   svc_row cron
@@ -6923,19 +7125,23 @@ menu_tools() {
   while true; do
     c=$(ui_menu "Database tools" "$(feat_has dbadmin && tools_url || echo "Not installed")" \
       status   "Show URL and login" \
-      install  "Install Adminer / phpMyAdmin" \
+      install  "Install Adminer / phpMyAdmin / pgweb" \
       password "New login password" \
       allow    "Restrict to IP addresses" \
       host     "Serve under another site's domain" \
       db-user  "Create an admin database login" \
       update   "Update to the newest versions" \
-      remove   "Remove the tools" \
+      remove   "Remove one tool, or all of them" \
       back     "Back") || return 0
     ui_clear
     case $c in
       back)  return 0 ;;
       allow) if v=$(ui_input "Allowed IPs/ranges, space-separated (blank = any)" "$(cfg_get TOOLS_ALLOW)" empty); then try cmd_tools allow "${v:-off}"; fi ;;
       host)  if v=$(pick_site); then try cmd_tools host "$v"; fi ;;
+      remove)
+        if v=$(ui_menu "Remove database tools" "Remove which?" adminer "Adminer only" phpmyadmin "phpMyAdmin only" pgweb "pgweb only" all "All tools"); then
+          if [[ $v == all ]]; then try cmd_tools remove; else try cmd_tools remove "$v"; fi
+        fi ;;
       *)     try cmd_tools "$c" ;;
     esac
     pause
@@ -7026,7 +7232,7 @@ Admin
   dashboard [--interval 5]     Live view: resources, services, sites, apps, alerts
   check [--notify] [--quiet]   Health checks (exit code 0 ok, 1 warnings, 2 failures)
   notify setup|test|off|deploys on|off   Alerts via Telegram, Slack, Discord or a webhook
-  tools [status|install [adminer|phpmyadmin]|password|allow "ips"|host <domain>|db-user|update|remove]
+  tools [status|install [adminer|phpmyadmin|pgweb]|password|allow "ips"|host <domain>|db-user|update|remove [tool]]
   ip [status|block|page [file.html|folder]|redirect <domain>|site <domain>]
                                What http://<server-ip> shows (default: block; HTTPS on the IP is always refused)
   cron <domain> list | add "<schedule>" "<command>" | remove <n> | run <n>

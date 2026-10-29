@@ -11,7 +11,7 @@ confirmations), `--plain` (plain text prompts). `srv version` prints the version
 |---|---|
 | `srv` | Interactive menu |
 | `srv setup` | Setup wizard (interactive only) |
-| `srv install [feature] [version]` | Install or reconfigure a feature; no name = checklist. Features: `upgrade timezone hostname swap sudo-user ssh firewall fail2ban auto-updates nginx php composer database postgres redis node python supervisor pm2 certbot backup rclone webhook dbadmin`. Aliases: `mysql`, `mariadb`, `pg`/`pgsql`/`postgresql`, `nodejs`, `redis-server`, `ufw`, `ssl`/`letsencrypt`, `adminer`, `phpmyadmin`, `tools` |
+| `srv install [feature] [version]` | Install or reconfigure a feature; no name = checklist. Features: `upgrade timezone hostname swap sudo-user ssh firewall fail2ban auto-updates nginx php composer database postgres redis node python supervisor pm2 certbot backup rclone webhook dbadmin`. Aliases: `mysql`, `mariadb`, `pg`/`pgsql`/`postgresql`, `nodejs`, `redis-server`, `ufw`, `ssl`/`letsencrypt`, `adminer`, `phpmyadmin`, `pgweb`, `tools` |
 | `srv status` | Server, services, features, sites, apps and certificates |
 | `srv dashboard [--interval N] [--once]` | Live view (`srv top` too); `q` quits |
 | `srv check [--notify] [--quiet]` | Health checks; exit 0 ok, 1 warnings, 2 failures |
@@ -132,12 +132,13 @@ Add `--mysql` or `--pg` when both servers are installed.
 | Command | What it does |
 |---|---|
 | `srv tools [status]` | Database tools URL and settings |
-| `srv tools install [adminer\|phpmyadmin\|both] [--host H] [--allow "ips"]` | Install |
+| `srv tools install [adminer\|phpmyadmin\|pgweb\|both\|all …] [--host H] [--allow "ips"] [--file F]` | Install tools (no name = checklist); others stay |
 | `srv tools password [user]` | New basic-auth password |
 | `srv tools allow "ips"\|off` | IP allowlist |
 | `srv tools host <domain>\|_` | Where the tools are served |
 | `srv tools db-user [--mysql\|--pg]` | Create/reset the `srv_admin` database login |
-| `srv tools update\|remove` | Update / remove |
+| `srv tools update` | Update every installed tool |
+| `srv tools remove [adminer\|phpmyadmin\|pgweb]` | Remove one tool, or (no name) all of them |
 | `srv ip [status]` | What the server IP shows |
 | `srv ip block` | Close connections to the IP (default) |
 | `srv ip page [file.html\|folder]` | Show a static page from `/var/www/_srv/ip` |
@@ -215,7 +216,7 @@ column.
 | `BACKUP_KEEP_DAYS`, `BACKUP_FILES` | Local retention, include site files | `srv install backup` |
 | `BACKUP_REMOTE`, `BACKUP_REMOTE_KEEP` | Remote target and retention | `srv backup remote setup` |
 | `NOTIFY_TYPE`, `NOTIFY_TOKEN`, `NOTIFY_CHAT`, `NOTIFY_URL`, `NOTIFY_DEPLOYS` | Alerts | `srv notify setup` |
-| `TOOLS_HOST`, `TOOLS_PATH`, `TOOLS_ALLOW`, `TOOLS_USER`, `TOOLS_PHP` | Database tools | `srv tools host <current host>` |
+| `TOOLS_HOST`, `TOOLS_PATH`, `TOOLS_ALLOW`, `TOOLS_USER`, `TOOLS_PHP`, `PGWEB_PORT` | Database tools | `srv tools host <current host>` |
 | `WEBHOOK_PORT` | Webhook receiver port (9000) | — |
 | `UPDATE_URL` | Source for `srv self-update` | — |
 | `IP_MODE`, `IP_TARGET` | What the server IP shows: `block`, `page`, `redirect`, `site` | `srv ip …` |
@@ -242,7 +243,7 @@ column.
 | `/opt/srv/run/<domain>.sh` | App launchers |
 | `/opt/srv/node/<major>/` | Node.js versions |
 | `/opt/srv/python/` | Extra Python versions (uv) |
-| `/opt/srv/tools/`, `/opt/srv/tools-web/` | Adminer / phpMyAdmin |
+| `/opt/srv/tools/`, `/opt/srv/tools-web/` | Adminer, phpMyAdmin, the pgweb binary, the tools' start page |
 | `/opt/srv/webhook.py` | Webhook receiver (`srv-webhook.service`) |
 | `/var/lib/srv/` | Deploy queue, check state |
 | `/var/backups/srv/` | `db/`, `pgsql/`, `files/` |
@@ -258,6 +259,7 @@ column.
 | Laravel workers | Supervisor group `srv-<user>-laravel` |
 | PHP-FPM pool | `/etc/php/<v>/fpm/pool.d/srv-<user>.conf` in `php<v>-fpm` |
 | Webhook receiver | `srv-webhook.service`, queue runner `srv-deploy-queue.path` |
+| pgweb | `srv-pgweb.service` (as `srv-tools`, on `127.0.0.1:8081` or the next free port) |
 | Cron files | `/etc/cron.d/srv-check` (alerts), `srv-backup` (02:30), `srv-<user>` (Laravel scheduler), `srv-<user>-jobs` (your jobs) |
 
 `<user>` is the site user, e.g. `example_com`.

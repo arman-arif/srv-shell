@@ -123,20 +123,29 @@ sudo srv notify setup --webhook https://example.com/alerts
 
 ## Database tools
 
-Adminer and/or phpMyAdmin, served from a secret URL, behind a password, and
+Web tools for your databases, served from a secret URL, behind a password, and
 optionally only for your IP addresses.
 
+| Tool | Databases | Notes |
+|---|---|---|
+| **Adminer** | MySQL/MariaDB and PostgreSQL | One PHP file. A good default |
+| **phpMyAdmin** | MySQL/MariaDB only | The familiar full-featured MySQL tool |
+| **pgweb** | PostgreSQL only | A small, fast app (no PHP needed): browse tables, run SQL with history, see structure, indexes and constraints, export CSV/JSON/XML |
+
+Install any combination; adding one never touches the others:
+
 ```bash
-sudo srv tools install                 # asks: Adminer, phpMyAdmin or both; host; IP allowlist
-sudo srv tools install phpmyadmin
+sudo srv tools install                 # checklist; then host and IP allowlist on first install
+sudo srv tools install pgweb           # add one tool
+sudo srv tools install adminer pgweb   # or several (also: both = Adminer + phpMyAdmin, all)
 sudo srv tools install adminer --host example.com --allow "203.0.113.7"
-sudo srv tools                         # URL(s), user, host, allowlist
+sudo srv tools                         # URL, login, versions, allowlist
 ```
 
-**Which tool for which database:** phpMyAdmin only works with MariaDB/MySQL.
-For PostgreSQL, use Adminer, which handles both. You can have both installed;
-`srv tools install adminer` adds Adminer without touching phpMyAdmin. Both are
-then linked from the tools URL (`…/adminer/` and `…/phpmyadmin/`).
+All installed tools are linked from the tools URL: `…/adminer/`,
+`…/phpmyadmin/` and `…/pgweb/`. Without internet access on the server, install
+from a downloaded file: `srv tools install phpmyadmin --file phpMyAdmin-….tar.gz`
+or `srv tools install pgweb --file pgweb_linux_amd64.zip`.
 
 ### Logging in
 
@@ -153,7 +162,8 @@ There are two logins:
    sudo srv tools db-user --pg
    ```
    In Adminer, pick **System: PostgreSQL** (or MySQL) and use `localhost` as
-   the server.
+   the server. In pgweb, use host `localhost`, port `5432`, your user, password
+   and database, and SSL mode `disable` (the connection never leaves the server).
    The database `root` user can't log in through the tools: on the server it
    uses socket authentication, which is the safe default.
 
@@ -181,12 +191,21 @@ sudo srv tools allow off                              # any address (password st
 ### Updating and removing
 
 ```bash
-sudo srv tools update                  # newest Adminer / phpMyAdmin
-sudo srv tools remove
+sudo srv tools update                  # newest Adminer / phpMyAdmin / pgweb
+sudo srv tools remove pgweb            # remove one tool (adminer, phpmyadmin, pgweb)
+sudo srv tools remove                  # remove all of them
 ```
 
-The tools run in their own PHP-FPM pool as the user `srv-tools`, restricted with
-`open_basedir`, so they can't read the sites' files.
+How they're isolated:
+
+- Everything runs as the system user `srv-tools`, which can't read the sites'
+  files.
+- Adminer and phpMyAdmin run in their own PHP-FPM pool, restricted with
+  `open_basedir`. The pool only exists while one of them is installed.
+- pgweb runs as the `srv-pgweb` service, listening on `127.0.0.1` only, with
+  systemd sandboxing, a 256 MB memory cap and SSH tunnels turned off. Nginx puts
+  it behind the same password and IP allowlist. Each browser gets its own
+  database session, which closes after an hour without use.
 
 ## Cron jobs for sites
 

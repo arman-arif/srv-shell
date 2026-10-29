@@ -82,7 +82,7 @@ so you can pick new ones.
 | `backup` | Daily backups of databases and site files at 02:30, with rotation |
 | `rclone` | rclone for copying backups to S3, R2, B2, Google Drive and others |
 | `webhook` | The webhook receiver for auto-deploys on git push |
-| `dbadmin` | Adminer and/or phpMyAdmin behind a secret URL and a password |
+| `dbadmin` | Adminer, phpMyAdmin and/or pgweb behind a secret URL and a password |
 
 ## Adding features later
 

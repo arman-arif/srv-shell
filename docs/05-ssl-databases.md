@@ -103,7 +103,7 @@ ssh -N -L 5433:127.0.0.1:5432 you@server
 
 Then connect your client (TablePlus, DBeaver, DataGrip…) to `127.0.0.1:3307` or
 `127.0.0.1:5433` with the site's database user. Or use the web tools
-(Adminer/phpMyAdmin), see [Administration](08-admin.md#database-tools).
+(Adminer, phpMyAdmin, or pgweb for PostgreSQL), see [Administration](08-admin.md#database-tools).
 
 ### Root access on the server
 
