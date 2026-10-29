@@ -155,6 +155,8 @@ cfg_get()  { kv_get "$SRV_CFG" "$1" "${2-}"; }
 cfg_set()  { kv_set "$SRV_CFG" "$1" "$2"; }
 
 # ── UI: whiptail dialogs with a plain-prompt fallback ────────────────────────
+ui_clear() { if (( USE_WT )); then printf '\033[H\033[2J' >&2; fi; return 0; }
+
 ui_init() {
   USE_WT=0
   if (( INTERACTIVE )) && [[ $SRV_PLAIN != 1 ]] && command -v whiptail >/dev/null 2>&1; then USE_WT=1; fi
@@ -289,7 +291,9 @@ gen_password() {
 
 valid_domain()   { [[ $1 =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$ ]]; }
 valid_db_ident() { [[ $1 =~ ^[A-Za-z0-9_]{1,63}$ ]]; }
-valid_port()     { [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= 1024 && $1 <= 65535 )); }
+valid_port()     { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1024 && 10#$1 <= 65535 )); }
+# Leading zeros would make bash read numbers as octal ("08" is an error) — normalize typed numbers
+dec()            { if [[ $1 =~ ^[0-9]{1,9}$ ]]; then printf '%d' "$(( 10#$1 ))"; else printf '%s' "$1"; fi; }
 valid_relpath()  { [[ $1 != *..* && $1 =~ ^[A-Za-z0-9._/-]*$ ]]; }
 
 pkg_installed() { [[ $(dpkg-query -W -f='${Status}' "$1" 2>/dev/null || true) == "install ok installed" ]]; }
@@ -546,7 +550,7 @@ mod_swap() {
   fi
   local size=${OPT_SWAP:-2G} mb
   if [[ $size == existing ]]; then size=2G; fi
-  case ${size: -1} in G) mb=$(( ${size%?} * 1024 )) ;; *) mb=${size%?} ;; esac
+  case ${size: -1} in G) mb=$(( 10#${size%?} * 1024 )) ;; *) mb=$(( 10#${size%?} )) ;; esac
   step "Creating a $size swap file"
   if ! fallocate -l "${mb}M" /swapfile 2>>"$SRV_LOG"; then
     run dd if=/dev/zero of=/swapfile bs=1M count="$mb" status=none
@@ -610,7 +614,7 @@ ask_ssh() {
   local cur p
   cur=$(ssh_port)
   while true; do
-    p=$(ui_input "SSH port (keep $cur unless you have a reason to change it)" "$cur") || die "Cancelled."
+    p=$(ui_input "SSH port (keep $cur unless you have a reason to change it)" "$cur") || die "Cancelled."; p=$(dec "$p")
     if [[ $p =~ ^[0-9]+$ ]] && (( p > 0 && p < 65536 )); then break; fi
     warn "Enter a port between 1 and 65535"; retry_or_die "Invalid port: $p"
   done
@@ -1473,7 +1477,7 @@ EOF
 ask_backup() {
   local d
   while true; do
-    d=$(ui_input "Keep database backups for how many days?" "$(cfg_get BACKUP_KEEP_DAYS 7)") || die "Cancelled."
+    d=$(ui_input "Keep database backups for how many days?" "$(cfg_get BACKUP_KEEP_DAYS 7)") || die "Cancelled."; d=$(dec "$d")
     if [[ $d =~ ^[0-9]+$ ]] && (( d >= 1 )); then break; fi
     warn "Enter a number of days (1 or more)"; retry_or_die "Invalid number of days: $d"
   done
@@ -1709,6 +1713,7 @@ install_features() {
   done
   if (( INTERACTIVE && ! ASSUME_YES )); then
     ui_yesno "Ready to install:"$'\n\n'"$(feature_summary "${final[@]}")"$'\n\n'"Proceed?" yes || die "Cancelled."
+    ui_clear
   fi
 
   if ! feat_has base; then
@@ -2353,7 +2358,8 @@ env_set() {
   local file=$1 key=$2 val=$3 tmp
   tmp=$(mktemp)
   if grep -qE "^#?[[:space:]]*${key}=" "$file"; then
-    awk -v k="$key" -v v="$val" '!done && $0 ~ "^#?[[:space:]]*" k "=" { print k "=" v; done=1; next } { print }' "$file" >"$tmp"
+    # value passed via the environment, not argv, so secrets don't show up in ps
+    SRV_K=$key SRV_V=$val awk 'BEGIN { k = ENVIRON["SRV_K"]; v = ENVIRON["SRV_V"] } !done && $0 ~ "^#?[[:space:]]*" k "=" { print k "=" v; done=1; next } { print }' "$file" >"$tmp"
   else
     cp "$file" "$tmp"
     if [[ -s $tmp && -n $(tail -c 1 "$tmp") ]]; then echo >>"$tmp"; fi
@@ -2475,6 +2481,7 @@ site_ask_python() {
     local c; c=$(nproc 2>/dev/null || echo 1)
     S_WORKERS=$(( c * 2 + 1 )); if (( S_WORKERS > 9 )); then S_WORKERS=9; fi
   fi
+  S_WORKERS=$(dec "$S_WORKERS")
   [[ $S_WORKERS =~ ^[0-9]+$ ]] && (( S_WORKERS >= 1 && S_WORKERS <= 64 )) || die "Workers must be between 1 and 64."
 }
 
@@ -2657,6 +2664,7 @@ site_add() {
   if is_app_type "$type"; then
     site_ask_pm
     if [[ -n $S_PORT ]]; then
+      S_PORT=$(dec "$S_PORT")
       valid_port "$S_PORT" || die "Port must be between 1024 and 65535."
       if port_used_by_site "$S_PORT"; then die "Port $S_PORT is already assigned to another site."; fi
       if port_in_use "$S_PORT"; then warn "Something is already listening on port $S_PORT."; fi
@@ -2734,6 +2742,7 @@ site_add() {
       "$domain" "${aliases:-none}" "$type" "$detail" "$user" \
       "$([[ $want_db == yes ]] && eng_label "$engine" || echo no)" "$want_redis" "$want_ssl")
     ui_yesno "Create this site?"$'\n\n'"$summary" yes || die "Cancelled."
+    ui_clear
   fi
 
   # Create
@@ -2996,6 +3005,7 @@ site_set_cmd() {
   # shellcheck disable=SC2086
   in_list "$k" $allowed || die "Editable keys for $type sites: $allowed"
   [[ $v != *$'\n'* ]] || die "The value must be a single line."
+  case $k in WORKERS|TIMEOUT|DEPLOY_KEEP|PORT) v=$(dec "$v") ;; esac
   case $k in
     START_CMD)   [[ -n $v ]] || die "The start command can't be empty." ;;
     PY_APP)      [[ -z $v || $v =~ ^[A-Za-z0-9_.]+:[A-Za-z0-9_.()]+$ ]] || die "Invalid module (e.g. main:app)" ;;
@@ -3888,13 +3898,14 @@ site_workers() {
     if [[ $h == no ]]; then
       while true; do
         q=$(ui_input "Number of queue:work processes (0 = none)" "$(( cq > 0 ? cq : 1 ))") || die "Cancelled."
-        if [[ $q =~ ^[0-9]+$ ]] && (( q <= 32 )); then break; fi
+        q=$(dec "$q"); if [[ $q =~ ^[0-9]+$ ]] && (( q <= 32 )); then break; fi
         warn "Enter a number from 0 to 32"
       done
     fi
     if ui_yesno "Run Laravel Reverb (WebSockets)? Nginx will send /app/* and /apps/* to it." "$cr"; then r=yes; else r=no; fi
   fi
   q=${q:-$cq}; h=${h:-$ch}; r=${r:-$cr}
+  q=$(dec "$q")
   [[ $q =~ ^[0-9]+$ ]] && (( q <= 32 )) || die "Queue workers must be 0–32."
   if [[ $h == yes ]]; then q=0; fi
   if (( q > 0 )) || [[ $h == yes || $r == yes ]]; then ensure_feature supervisor; fi
@@ -4100,7 +4111,7 @@ deploy_setup() {
   site_set "$d" REPO "$repo"
   site_set "$d" BRANCH "$branch"
   if [[ -n $keep ]]; then
-    [[ $keep =~ ^[0-9]+$ ]] && (( keep >= 2 && keep <= 50 )) || die "--keep must be 2–50"
+    keep=$(dec "$keep"); [[ $keep =~ ^[0-9]+$ ]] && (( keep >= 2 && keep <= 50 )) || die "--keep must be 2–50"
     site_set "$d" DEPLOY_KEEP "$keep"
   elif ! site_has_key "$d" DEPLOY_KEEP; then site_set "$d" DEPLOY_KEEP 5; fi
   local sh x; sh=$(deploy_default_shared "$d")
@@ -4879,6 +4890,7 @@ cron_remove() {
     n=$(ui_menu "Cron: $d" "Remove which job?" "${items[@]}") || die "Cancelled."
   fi
   total=$(grep -c . "$store")
+  n=$(dec "$n")
   [[ $n =~ ^[0-9]+$ ]] && (( n >= 1 && n <= total )) || die "No job number $n (see: srv cron $d list)"
   tmp=$(mktemp); awk -v n="$n" 'NR != n' "$store" >"$tmp"; cat "$tmp" >"$store"; rm -f "${tmp:?}"
   cron_render "$d"
@@ -4931,6 +4943,9 @@ ask_dbadmin() {
       adminer    "Adminer — one file, MySQL/MariaDB + PostgreSQL (recommended)" \
       phpmyadmin "phpMyAdmin — MySQL/MariaDB" \
       both       "Both") || die "Cancelled."
+  fi
+  if [[ -z $OPT_TOOLS_HOST ]] && (( ! INTERACTIVE )); then
+    die "Add --host <domain> to choose where the tools are served (or --host _ for the server IP)."
   fi
   if [[ -z $OPT_TOOLS_HOST ]]; then
     local -a items=(); local d
@@ -5101,7 +5116,7 @@ tools_apply_host() {
 tools_set_password() {
   local user pass hash
   user=$(cfg_get TOOLS_USER admin); pass=$(gen_password 20)
-  hash=$(openssl passwd -6 "$pass") || { err "openssl passwd failed"; return 1; }
+  hash=$(openssl passwd -6 -stdin <<<"$pass") || { err "openssl passwd failed"; return 1; }
   printf '%s:%s\n' "$user" "$hash" >"$TOOLS_HTPASSWD"
   chown root:www-data "$TOOLS_HTPASSWD"; chmod 640 "$TOOLS_HTPASSWD"
   TOOLS_NEW_PASS=$pass
@@ -5597,6 +5612,7 @@ cmd_dashboard() {
       *) die "Usage: srv dashboard [--interval seconds] [--once]" ;;
     esac
   done
+  interval=$(dec "$interval")
   [[ $interval =~ ^[0-9]+$ ]] && (( interval >= 2 )) || die "The interval must be 2 seconds or more."
   if (( ! INTERACTIVE )); then once=1; fi
   if (( ! once )); then tput civis 2>/dev/null || true; trap 'tput cnorm 2>/dev/null || true' RETURN; fi
@@ -6262,6 +6278,7 @@ remote_setup() {
     remote="srv-remote:${bucket:+$bucket/}$prefix"
   fi
   if [[ -z $keep ]]; then keep=$(ui_input "Keep remote copies for how many days?" "$(cfg_get BACKUP_REMOTE_KEEP 30)") || die "Cancelled."; fi
+  keep=$(dec "$keep")
   [[ $keep =~ ^[0-9]+$ ]] && (( keep >= 1 )) || die "Days must be 1 or more."
   local old_remote old_keep; old_remote=$(cfg_get BACKUP_REMOTE); old_keep=$(cfg_get BACKUP_REMOTE_KEEP)
   cfg_set BACKUP_REMOTE "$remote"; cfg_set BACKUP_REMOTE_KEEP "$keep"
@@ -6426,6 +6443,7 @@ main_menu() {
       setup   "Run the server setup wizard" \
       status  "Server status" \
       quit    "Exit") || break
+    ui_clear
     case $c in
       quit)    break ;;
       sites)   try menu_sites; continue ;;
@@ -6466,6 +6484,7 @@ menu_sites() {
       disable   "Disable a site" \
       remove    "Remove a site" \
       back      "Back") || return 0
+    ui_clear
     case $c in
       back) return 0 ;;
       list) site_list ;;
@@ -6501,6 +6520,7 @@ menu_apps() {
       logs    "Recent output" \
       manager "Switch process manager (systemd / PM2 / Supervisor)" \
       back    "Back") || return 0
+    ui_clear
     case $c in
       back) return 0 ;;
       list) app_list ;;
@@ -6518,6 +6538,7 @@ menu_ssl() {
       list       "List certificates" \
       renew-test "Test automatic renewal" \
       back       "Back") || return 0
+    ui_clear
     if [[ $c == back ]]; then return 0; fi
     try cmd_ssl "$c"
     pause
@@ -6533,6 +6554,7 @@ menu_db() {
       drop     "Drop a database" \
       password "Reset a user's password" \
       back     "Back") || return 0
+    ui_clear
     if [[ $c == back ]]; then return 0; fi
     try cmd_db "$c"
     pause
@@ -6551,6 +6573,7 @@ menu_deploy() {
       key      "Show the SSH deploy key" \
       log      "Deploy log" \
       back     "Back") || return 0
+    ui_clear
     case $c in
       back)  return 0 ;;
       setup) try deploy_setup ;;
@@ -6582,6 +6605,7 @@ menu_check() {
       test   "Send a test alert" \
       off    "Turn alerts off" \
       back   "Back") || return 0
+    ui_clear
     case $c in
       back)  return 0 ;;
       check) try cmd_check ;;
@@ -6609,6 +6633,7 @@ menu_runtimes() {
       py-install   "Python: install a version" \
       py-remove    "Python: remove a version" \
       back         "Back") || return 0
+    ui_clear
     case $c in
       back)         return 0 ;;
       php-list)     php_cmd_list ;;
@@ -6647,6 +6672,7 @@ menu_tools() {
       update   "Update to the newest versions" \
       remove   "Remove the tools" \
       back     "Back") || return 0
+    ui_clear
     case $c in
       back)  return 0 ;;
       allow) if v=$(ui_input "Allowed IPs/ranges, space-separated (blank = any)" "$(cfg_get TOOLS_ALLOW)" empty); then try cmd_tools allow "${v:-off}"; fi ;;
@@ -6670,6 +6696,7 @@ menu_backup() {
       remote     "Remote storage (S3, R2, B2, Google Drive …)" \
       schedule   "Daily automatic backups" \
       back       "Back") || return 0
+    ui_clear
     case $c in
       back)       return 0 ;;
       run)        try backup_run ;;
@@ -6838,7 +6865,7 @@ main() {
       case ${1:-} in list|ls) ;; run) acquire_lock 3600 ;; *) acquire_lock ;; esac
       cmd_backup "$@" ;;
     status)  cmd_status ;;
-    check)   cmd_check "$@" ;;
+    check)   cmd_check "$@" || exit $? ;;   # 1 = warnings, 2 = failures (not an error)
     dashboard|top) cmd_dashboard "$@" ;;
     notify|alerts)
       case ${1:-} in status|"") ;; *) acquire_lock ;; esac
