@@ -26,6 +26,21 @@ script it from the command line, CI or cron.
   optional IP allowlist; health checks with Telegram, Slack, Discord or
   webhook alerts; a live dashboard; per-site cron jobs; and self-update.
 
+## Documentation
+
+The full guide is in [`docs/`](docs/README.md):
+[getting started](docs/01-getting-started.md) ·
+[sites](docs/02-sites.md) ·
+[apps](docs/03-apps.md) ·
+[git deploys](docs/04-deploys.md) ·
+[SSL & databases](docs/05-ssl-databases.md) ·
+[backups](docs/06-backups.md) ·
+[runtimes](docs/07-runtimes.md) ·
+[administration](docs/08-admin.md) ·
+[recipes](docs/09-recipes.md) ·
+[command reference](docs/10-reference.md) ·
+[troubleshooting](docs/11-troubleshooting.md)
+
 ## Requirements
 
 - Ubuntu 22.04 or newer (LTS recommended), or Debian 12 or newer
@@ -153,7 +168,8 @@ message.
 | Runtimes | `php list\|install\|default\|remove\|ext`, `node list\|install\|default\|upgrade\|remove`, `python list\|install\|remove` |
 | Admin | `tools …` (Adminer/phpMyAdmin), `notify …`, `cron <domain> …`, `ssl add\|list\|renew-test` |
 
-Run `srv help` for the full reference with all options. `-y`/`--yes` accepts
+Run `srv help` for the full reference with all options, or see the
+[command reference](docs/10-reference.md). `-y`/`--yes` accepts
 defaults and confirmations; `--plain` uses plain-text prompts instead of dialog
 boxes.
 
