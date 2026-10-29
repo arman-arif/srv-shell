@@ -46,6 +46,17 @@ Nginx can't reach the app.
   on the server.
 - Restart and watch: `srv app restart <domain> && srv app logs <domain>`.
 
+## A service doesn't answer
+
+- `srv service status <domain> <name>` and `srv service logs <domain> <name>`.
+- It must listen on `$PORT` (see `srv service info`). `running*` in
+  `srv service list` means the process is up but nothing listens on its port.
+- **Path services get the full path** (`/socket.io/…`). If your service expects
+  requests at `/`, either change its routes or add the prefix stripping:
+  `srv service set <domain> <name> STRIP yes`.
+- After changing its code without git: `srv service build <domain> <name>`.
+- On its own domain: DNS must point here, then `srv service ssl <domain> <name>`.
+
 ## 500 errors (PHP, Laravel)
 
 - `srv site logs <domain> php` (PHP-FPM) and `srv site logs <domain> laravel`.

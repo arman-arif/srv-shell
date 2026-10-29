@@ -1,7 +1,9 @@
 # 3. Apps and processes
 
 Node.js and Python sites run a long-lived server process: the *app*. Laravel
-sites can have *workers* (queues, Horizon, Reverb). This guide covers both.
+sites can have *workers* (queues, Horizon, Reverb), and any site can have extra
+*services* (a socket server, a worker, a bot) running from its code. This guide
+covers all three.
 
 ## How an app runs
 
@@ -180,18 +182,106 @@ sudo srv app restart app.example.com
 The app then finds `REDIS_URL` (with password and its own database number) in its
 environment. See [Sites → Redis per site](02-sites.md#redis-per-site).
 
-## Side processes
+## Services: extra processes inside a site
 
-srv runs one main process per app site. For an extra long-running process
-(a second server, a worker script), the simplest options are:
+A site's main app is one process. **Services** are any number of extra
+long-running processes that live inside a site's code: a socket.io server in a
+`socket/` folder of a Laravel or PHP site, a queue consumer, a Telegram bot, a
+small API next to a static site. They work for every site type except `proxy`.
 
-- create a second site for it (for example a subdomain, or a `node` site you
-  don't point DNS at), or
-- run it with PM2 as the site user: `sudo -u example_com pm2 start worker.js`
-  and then `sudo -u example_com pm2 save` so the site's PM2 daemon brings it back
-  at boot (this only works for sites using PM2).
+```bash
+# A socket.io server in /var/www/example.com/app/socket, at https://example.com/socket.io/
+sudo srv service add example.com socket --start "node server.js" --path /socket.io/
 
-See the [socket.io recipe](09-recipes.md#socketio-server-on-a-subdomain) for a
-worked example.
+# The same folder on its own domain, under PM2
+sudo srv service add example.com socket --start "node server.js" \
+     --domain socket.example.com --pm pm2 --ssl
+
+# A background worker with no web address
+sudo srv service add example.com mailer --dir workers --start "python mailer.py" --internal
+```
+
+### What srv does for a service
+
+- **Runs it from its folder**: `--dir` inside the site's code (by default the
+  service's name), so `socket` runs from `app/socket`, or `current/socket` for
+  git sites. Nothing is copied.
+- **Runs it as the site's user**, under systemd (default), PM2 or Supervisor,
+  restarting it if it crashes and at boot.
+- **Installs its dependencies** (`srv service build`): Node.js uses the
+  detected package manager; Python gets its own virtualenv in `<folder>/.venv`
+  and installs `requirements.txt` or `pyproject.toml`.
+- **Gives it a port** in `$PORT` (and `HOST=127.0.0.1`) when it's reachable
+  from the web. **The service must listen on `$PORT`.**
+- **Loads the environment**: the site's `app.env`, then the service's own
+  `/var/www/<domain>/svc-<name>.env`. Laravel and other apps can of course also
+  read their own `.env` from the site folder.
+- **Puts it behind Nginx** (see below), with WebSocket support on by default.
+- **Keeps it in step with deploys**: each deploy installs the service's
+  dependencies inside the new release, before the switch, and restarts the
+  service after the switch. A rollback restarts it on the old release, so the
+  site and its services always run the same version of your code.
+- **Watches it**: `srv check` (and alerts) report a service that isn't running
+  or not listening on its port, and `srv status`, backups and restores include
+  services. Removing the site removes its services.
+
+### How a service is reached
+
+| Option | Address | Notes |
+|---|---|---|
+| `--path /socket.io/` | `https://example.com/socket.io/` | Same domain as the site, so no CORS and no extra certificate. The full path is passed on (socket.io expects that). Add `--strip` to remove the prefix instead (`/api/users` → `/users`) |
+| `--domain socket.example.com` | `https://socket.example.com/` | Its own server block. Point DNS at the server first; `--ssl` (or later `srv service ssl <domain> <name>`) gets the certificate |
+| `--internal` | none | Workers, bots, queue consumers. No port is assigned unless you pass `--port` |
+
+Without any of them, srv asks (or uses `--internal` with `--yes`).
+
+### All options for `service add`
+
+| Option | Meaning |
+|---|---|
+| `--dir <folder>` | Folder inside the site's code (default: the service's name; blank = the app folder itself) |
+| `--start "<cmd>"` | Start command, run in that folder. Default for Node.js with a `start` script: `npm start` |
+| `--runtime node\|python\|command` | Detected from `package.json` / `requirements.txt` / `pyproject.toml`; `command` runs anything (a binary, `php artisan …`) |
+| `--node 22` / `--python 3.12` | Version for this service (default: the server's default Node.js / the system Python) |
+| `--install "<cmd>"` / `--build "<cmd>"` | Override the dependency install, add a build step |
+| `--pm systemd\|pm2\|supervisor` | Process manager (default systemd) |
+| `--port <n>` | Fixed port instead of the next free one |
+| `--websocket` / `--no-websocket` | WebSocket pass-through (default on; idle connections stay open for an hour) |
+| `--timeout <s>` | Proxy timeout (default 60, at least 3600 with WebSockets) |
+| `--no-build` / `--no-start` | Only register it |
+
+### Managing services
+
+```bash
+sudo srv service list                          # all sites' services
+sudo srv service list example.com
+sudo srv service info example.com socket       # folder, runtime, port, address, log, env files
+sudo srv service restart example.com socket    # also: start, stop, status
+sudo srv service logs example.com socket       # follow the output (Ctrl+C to stop)
+sudo srv service build example.com socket      # reinstall dependencies, rebuild, restart
+sudo srv service exec example.com socket 'npm ls'
+sudo srv service set example.com socket START_CMD "node dist/server.js"
+sudo srv service manager example.com socket pm2
+sudo srv service remove example.com socket     # the code and its log stay
+```
+
+Keys for `service set`: `DIR`, `START_CMD`, `INSTALL_CMD`, `BUILD_CMD`,
+`NODE`, `PY_VERSION`, `PORT`, `ROUTE` (the path), `STRIP`, `WEBSOCKET`,
+`TIMEOUT`, `MAX_BODY`. To change how a service is reached (path, domain,
+internal), remove it and add it again.
+
+For sites **without** git deploys, run `srv service build` after uploading new
+code for the service. Git sites do it automatically on every deploy.
+
+Each service shows up in its process manager as:
+
+| Manager | Name |
+|---|---|
+| systemd | `srv-<user>-svc-<name>.service` |
+| PM2 | `<domain>--<name>` in the site user's PM2 (`sudo -u <user> pm2 status`) |
+| Supervisor | `srv-<user>-svc-<name>` |
+
+See the [socket.io recipe](09-recipes.md#socketio-server-for-a-site) for a
+complete example.
 
 Next: [Git deploys](04-deploys.md)

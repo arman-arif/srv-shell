@@ -10,7 +10,8 @@ offer to install what they need).
 - [Next.js](#nextjs)
 - [Nuxt or NestJS](#nuxt-or-nestjs)
 - [Express or any Node.js API](#express-or-any-nodejs-api)
-- [socket.io server on a subdomain](#socketio-server-on-a-subdomain)
+- [A worker or bot next to a site](#a-worker-or-bot-next-to-a-site)
+- [socket.io server for a site](#socketio-server-for-a-site)
 - [React/Vue/Vite single-page app from git](#reactvuevite-single-page-app-from-git)
 - [A static site](#a-static-site)
 - [Django](#django)
@@ -136,52 +137,66 @@ sudo srv site add api.example.com --type node --preset generic \
 In your code: `app.listen(process.env.PORT || 3000, '127.0.0.1')`.
 TypeScript? Use `--build "npm run build" --start "node dist/index.js"`.
 
-## socket.io server on a subdomain
+## socket.io server for a site
 
-Say the main site is `live.example.com` and you want the socket.io server on
-`socket.example.com`, run by PM2.
+Say the site is `example.com` (any type: Laravel, PHP, Node.js …) and the
+socket.io server lives in its `socket/` folder.
 
-1. Point a DNS A record for `socket.example.com` at the server.
-2. Create a Node.js site for it:
-   ```bash
-   sudo srv site add socket.example.com --type node --preset generic \
-        --start "node server.js" --build "" --pm pm2 --websocket \
-        --no-db --no-redis --aliases "" --ssl
-   ```
-3. Make the server listen on srv's port and allow your front-end's origin:
+1. Make the server listen on srv's port:
    ```js
    const httpServer = require('http').createServer();
-   const io = require('socket.io')(httpServer, {
-     cors: { origin: ['https://live.example.com'], credentials: true },
-   });
+   const io = require('socket.io')(httpServer);
    io.on('connection', (socket) => { /* … */ });
    httpServer.listen(process.env.PORT || 6001, '127.0.0.1');
    ```
-4. Put the code in place and start it. If it lives in another site's folder:
+2. Add it as a service of the site, at the path socket.io uses:
    ```bash
-   sudo rsync -a --delete --exclude node_modules \
-        /var/www/live.example.com/app/socket/ /var/www/socket.example.com/app/
-   sudo srv app build socket.example.com     # npm install, then start under PM2
+   sudo srv service add example.com socket --start "node server.js" --path /socket.io/
    ```
-   (Or deploy it from its own repository: `--repo …` in step 2.)
-5. In the browser: `io('https://socket.example.com')`.
+   srv installs its dependencies, starts it, and Nginx sends
+   `https://example.com/socket.io/` (WebSockets included) to it.
+3. In the browser, connect to the same site: `io()`. It's the same origin, so no
+   CORS configuration and no extra certificate are needed.
 
-Check it with `srv app status socket.example.com`,
-`srv app logs socket.example.com`, or PM2 itself:
-`sudo -u socket_example_com pm2 status`.
+Check it with `srv service status example.com socket` and
+`srv service logs example.com socket`. For git sites, every deploy updates the
+socket server together with the site (and a rollback rolls it back too); without
+git, run `srv service build example.com socket` after changing its code.
 
-`--websocket` makes Nginx pass the WebSocket upgrade through, and keeps idle
-connections open for at least an hour (the timeout is raised to 3600 seconds
-for WebSocket sites).
-
-**Alternative, the process stays in the main site:** run it with PM2 as the main
-site's user and put a proxy site in front:
+**On its own subdomain instead:** point DNS for `socket.example.com` at the
+server, then:
 ```bash
-sudo -u live_example_com bash -c 'cd /var/www/live.example.com/app/socket && PORT=6001 pm2 start server.js --name socket && pm2 save'
-sudo srv site add socket.example.com --type proxy --upstream 127.0.0.1:6001 --websocket --ssl
+sudo srv service add example.com socket --start "node server.js" \
+     --domain socket.example.com --ssl
 ```
-srv then doesn't manage that process (no `srv app` commands, no health check of
-the process itself), so the first way is usually better.
+In that case, allow your page's origin in the server (`cors: { origin:
+['https://example.com'] }`) and connect with `io('https://socket.example.com')`.
+
+**With PM2** (to use `pm2 monit` and friends), add `--pm pm2`; the service then
+appears as `example.com--socket` in `sudo -u example_com pm2 status`.
+
+**A socket.io server with its own repository** (not inside a site) is simply a
+Node.js site:
+```bash
+sudo srv site add socket.example.com --type node --preset generic \
+     --start "node server.js" --build "" --websocket --no-db --aliases "" --ssl \
+     --repo git@github.com:you/socket.git
+```
+
+## A worker or bot next to a site
+
+A queue consumer, a Telegram bot or any long-running script that belongs to a
+site runs as an internal service, with the site's environment:
+
+```bash
+sudo srv service add example.com bot --dir bot --start "node bot.js" --internal
+sudo srv service add example.com consumer --dir workers --start "python consume.py" --python 3.12 --internal
+echo 'BOT_TOKEN=123:abc' | sudo tee -a /var/www/example.com/svc-bot.env
+sudo srv service restart example.com bot
+```
+
+Python services get their own virtualenv in `<folder>/.venv`. For Laravel queue
+workers, use `srv site workers` instead (built in).
 
 ## React/Vue/Vite single-page app from git
 

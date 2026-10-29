@@ -14,7 +14,7 @@ commands below do.
 |---|---|---|
 | 1 | [Getting started](01-getting-started.md) | Installing srv, the setup wizard, the menu, adding features later, global options |
 | 2 | [Sites](02-sites.md) | Every site type, all `site add` options, managing, changing and removing sites, custom Nginx config, redirects, maintenance mode |
-| 3 | [Apps and processes](03-apps.md) | Node.js and Python apps, systemd, PM2 and Supervisor, environment variables, Laravel queues, Horizon and Reverb, Redis |
+| 3 | [Apps and processes](03-apps.md) | Node.js and Python apps, systemd, PM2 and Supervisor, environment variables, Laravel queues, Horizon and Reverb, Redis, services (socket servers, workers, bots inside a site) |
 | 4 | [Git deploys](04-deploys.md) | Releases, rollbacks, deploy keys, webhooks for GitHub, GitLab and Bitbucket, every `DEPLOY_*` setting |
 | 5 | [SSL and databases](05-ssl-databases.md) | Let's Encrypt certificates, MySQL/MariaDB and PostgreSQL databases and users |
 | 6 | [Backups and restore](06-backups.md) | Daily backups, restoring sites and databases, remote copies, moving to a new server |
@@ -24,7 +24,7 @@ commands below do.
 ## Look-ups
 
 - [Recipes](09-recipes.md): complete walkthroughs for Laravel, WordPress,
-  Next.js, a socket.io server on a subdomain, Django, FastAPI, a Docker
+  Next.js, a socket.io server for a site, a worker or bot, Django, FastAPI, a Docker
   container, a static site and more.
 - [Command reference](10-reference.md): every command and option on one page,
   every site setting and server setting, and where srv keeps its files.

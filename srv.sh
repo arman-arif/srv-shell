@@ -39,7 +39,7 @@
 set -Eeuo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-SRV_VERSION="4.2.0"
+SRV_VERSION="4.3.0"
 SRV_DIR="/etc/srv"
 SRV_STATE="$SRV_DIR/installed.conf"     # installed features
 SRV_CFG="$SRV_DIR/srv.conf"             # global settings
@@ -337,7 +337,7 @@ cert_days_left() {
 }
 
 port_in_use()       { [[ -n $(ss -Hltn "sport = :$1" 2>/dev/null) ]]; }
-port_used_by_site() { grep -qsE "^(PORT|REVERB_PORT)=$1\$" "$SRV_SITES"/*.conf; }
+port_used_by_site() { grep -qsE "^(PORT|REVERB_PORT)=$1\$" "$SRV_SITES"/*.conf "$SRV_DIR"/services/*/*.conf; }
 port_alloc() {
   local p; p=$(cfg_get APP_PORT_START 3001)
   while port_used_by_site "$p" || port_in_use "$p"; do
@@ -2283,6 +2283,7 @@ site_nginx_extras() {
     echo '    location = /__srv_maintenance { internal; error_page 503 /__srv_maintenance.html; return 503; }'
     echo "    location = /__srv_maintenance.html { internal; alias $SRV_WWW/maintenance.html; default_type text/html; add_header Retry-After 300 always; add_header Cache-Control \"no-store\" always; }"
   }
+  srvc_nginx_paths "$d"
   if [[ $(cfg_get TOOLS_HOST) == "$d" && -f $TOOLS_CONF ]]; then
     echo
     echo "    # Database tools — srv tools"
@@ -2384,6 +2385,7 @@ site_apply_nginx() {
   install -d -m 755 "$NGINX_CUSTOM/$d"
   site_render_nginx "$d" >"$avail"
   if [[ $(site_get "$d" ENABLED yes) == yes ]]; then ln -sfn "$avail" "$enabled"; else rm -f "$enabled"; fi
+  srvc_apply_vhosts "$d"
   ip_refresh_for "$d"
   if ! out=$(nginx -t 2>&1); then
     err "Nginx rejected the config for $d:"
@@ -2680,6 +2682,7 @@ site_add() {
   if site_exists "$domain"; then die "Site $domain already exists (see: srv site info $domain)."; fi
   local owner
   if owner=$(domain_in_use "$domain"); then die "$domain is already an alias of site $owner."; fi
+  if owner=$(srvc_domain_owner "$domain"); then die "$domain is the address of service $owner."; fi
 
   # Aliases
   if (( ! aliases_set )); then
@@ -3042,6 +3045,7 @@ site_disable() {
   local d; d=$(resolve_domain "${1:-}") || exit 1
   site_set "$d" ENABLED no
   rm -f "/etc/nginx/sites-enabled/$d.conf"
+  srvc_apply_vhosts "$d"
   ip_refresh_for "$d"
   nginx_reload || die "Nginx reload failed"
   ok "$d disabled (files, database, app process and config are kept)"
@@ -3090,6 +3094,7 @@ site_render_processes() {
   elif [[ $type == laravel ]] && { [[ -f $(laravel_conf "$d") ]] || (( $(site_get "$d" QUEUE_WORKERS 0) > 0 )); }; then
     laravel_render_workers "$d"
   fi
+  srvc_refresh_all "$d"
 }
 
 site_set_cmd() {
@@ -3362,6 +3367,7 @@ site_remove() {
   rm -f "${SRV_RUN:?}/${d:?}.sh" "${SRV_RUN:?}/${d:?}.pm2.config.js" "${HOOKS_DIR:?}/${d:?}.json" "${DEPLOY_QUEUE:?}/${d:?}"
   rm -rf "${SRV_DIR:?}/releases/${d:?}"
 
+  srvc_remove_all "$d" "$purge"
   if [[ $(cfg_get IP_TARGET) == "$d" ]]; then
     if [[ $(cfg_get IP_MODE block) == redirect || $(cfg_get IP_MODE) == site ]]; then
       cfg_set IP_MODE block; warn "The server IP showed $d — it now closes connections again (change with: srv ip)"
@@ -3732,11 +3738,14 @@ pm_remove() {
       if pm2_alive "$d"; then
         pm2_as "$d" delete "$d" >>"$SRV_LOG" 2>&1 || true
         pm2_as "$d" save --force >>"$SRV_LOG" 2>&1 || true
-        pm2_as "$d" kill >>"$SRV_LOG" 2>&1 || true
       fi
-      systemctl disable "pm2-$user.service" >>"$SRV_LOG" 2>&1 || true
-      rm -f "/etc/systemd/system/pm2-$user.service" "$SRV_RUN/$d.pm2.config.js"
-      run systemctl daemon-reload || true ;;
+      rm -f "$SRV_RUN/$d.pm2.config.js"
+      if ! srvc_any_pm2 "$d"; then   # the user's PM2 daemon may still run the site's services
+        if pm2_alive "$d"; then pm2_as "$d" kill >>"$SRV_LOG" 2>&1 || true; fi
+        systemctl disable "pm2-$user.service" >>"$SRV_LOG" 2>&1 || true
+        rm -f "/etc/systemd/system/pm2-$user.service"
+        run systemctl daemon-reload || true
+      fi ;;
   esac
 }
 
@@ -4065,6 +4074,825 @@ cmd_app() {
     ""|menu)        menu_apps ;;
     *) die "Unknown app command: $sub (see: srv help)" ;;
   esac
+}
+
+# =============================================================================
+#  SERVICES — extra long-running processes inside a site's code (srv service)
+#
+#  A service runs from a folder of its site (app/<dir>, or current/<dir> for git
+#  deploys) as the site's own user, under systemd, PM2 or Supervisor, with the
+#  site's app.env loaded. It is reached at a path of the site (e.g. /socket.io/),
+#  on its own domain, or not at all (internal). Deploys build it inside the new
+#  release and restart it after the switch, so a rollback brings back the
+#  matching version too.  Config: /etc/srv/services/<domain>/<name>.conf
+# =============================================================================
+SRV_SVCS="$SRV_DIR/services"
+
+srvc_file()   { printf '%s/%s/%s.conf' "$SRV_SVCS" "$1" "$2"; }
+srvc_exists() { [[ -f $(srvc_file "$1" "$2") ]]; }
+srvc_get()    { kv_get "$(srvc_file "$1" "$2")" "$3" "${4-}"; }
+srvc_set()    { kv_set "$(srvc_file "$1" "$2")" "$3" "$4"; }
+srvc_names()  {   # domain → service names, one per line
+  local f
+  for f in "$SRV_SVCS/$1"/*.conf; do
+    if [[ -f $f ]]; then basename "$f" .conf; fi
+  done
+}
+srvc_id()    { printf '%s--%s' "$1" "$2"; }                                     # launcher / PM2 name
+srvc_unit()  { printf 'srv-%s-svc-%s' "$(site_get "$1" SITE_USER)" "$2"; }      # systemd / Supervisor
+srvc_log()   { printf '%s/logs/svc-%s.log' "$(site_get "$1" HOME_DIR)" "$2"; }
+srvc_vhost() { printf 'srv-svc-%s.conf' "$(srvc_id "$1" "$2")"; }
+srvc_dir()   {   # domain name [base] → the service's folder (live code unless base is given)
+  local dir; dir=$(srvc_get "$1" "$2" DIR)
+  printf '%s%s' "${3:-$(site_get "$1" APP_DIR)}" "${dir:+/$dir}"
+}
+srvc_pm()    { srvc_get "$1" "$2" PM systemd; }
+srvc_mode()  { srvc_get "$1" "$2" MODE internal; }
+
+srvc_domain_owner() {   # domain → "site/name" of the service using it as its address
+  local n=$1 f s
+  for f in "$SRV_SVCS"/*/*.conf; do
+    [[ -f $f ]] || continue
+    if [[ $(kv_get "$f" DOMAIN) == "$n" ]]; then s=${f#"$SRV_SVCS"/}; printf '%s' "${s%.conf}"; return 0; fi
+  done
+  return 1
+}
+
+srvc_any_pm2() {   # domain [except-name] → is any (other) service of the site using PM2?
+  local n
+  while IFS= read -r n; do
+    [[ -n $n && $n != "${2:-}" ]] || continue
+    if [[ $(srvc_pm "$1" "$n") == pm2 ]]; then return 0; fi
+  done < <(srvc_names "$1")
+  return 1
+}
+
+srvc_path_env() {   # domain name [venv] → PATH for the service
+  local d=$1 n=$2 base=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin nv nb
+  case $(srvc_get "$d" "$n" RUNTIME command) in
+    node)
+      nv=$(srvc_get "$d" "$n" NODE); [[ -n $nv ]] || nv=$(cfg_get NODE_DEFAULT)
+      printf '%s/%s/bin:%s' "$NODE_ROOT" "$nv" "$base" ;;
+    python)
+      printf '%s/bin:%s' "${3:-$(srvc_dir "$d" "$n")/.venv}" "$base" ;;
+    *)
+      nb=$(node_default_bin); printf '%s%s' "${nb:+$nb:}" "$base" ;;
+  esac
+}
+
+srvc_render_launcher() {
+  local d=$1 n=$2 home dir port extra=""
+  home=$(site_get "$d" HOME_DIR); dir=$(srvc_dir "$d" "$n"); port=$(srvc_get "$d" "$n" PORT)
+  case $(srvc_get "$d" "$n" RUNTIME) in
+    node)   extra="NODE_ENV=production" ;;
+    python) extra="PYTHONUNBUFFERED=1" ;;
+  esac
+  install -d -m 755 "$SRV_RUN"
+  {
+    echo "#!/bin/bash"
+    echo "# Managed by srv — service '$n' of $d. Don't edit: change it with"
+    echo "# 'srv service set $d $n KEY value'. Environment variables: $home/app.env"
+    echo "# (shared with the site) and $home/svc-$n.env (this service only)."
+    echo "set -a"
+    echo "HOME=$home"
+    echo "PATH=$(srvc_path_env "$d" "$n")"
+    if [[ -n $extra ]]; then echo "$extra"; fi
+    echo "if [ -f $home/app.env ]; then . $home/app.env; fi"
+    echo "if [ -f $home/svc-$n.env ]; then . $home/svc-$n.env; fi"
+    if [[ -n $port ]]; then echo "PORT=$port"; echo "HOST=127.0.0.1"; fi
+    echo "set +a"
+    echo "cd $dir || exit 1"
+    echo "exec $(srvc_get "$d" "$n" START_CMD)"
+  } >"$SRV_RUN/$(srvc_id "$d" "$n").sh"
+  chmod 755 "$SRV_RUN/$(srvc_id "$d" "$n").sh"
+}
+
+# Process-manager config for one service (does not start anything)
+srvc_pm_write() {
+  local d=$1 n=$2 user home dir unit id log
+  user=$(site_get "$d" SITE_USER); home=$(site_get "$d" HOME_DIR); dir=$(srvc_dir "$d" "$n")
+  unit=$(srvc_unit "$d" "$n"); id=$(srvc_id "$d" "$n"); log=$(srvc_log "$d" "$n")
+  install -d -m 750 -o "$user" -g "$user" "$home/logs"
+  touch "$log"; chown "$user:$user" "$log"
+  case $(srvc_pm "$d" "$n") in
+    systemd)
+      cat >"/etc/systemd/system/$unit.service" <<EOF
+# Managed by srv — service '$n' of $d (srv service start|stop|restart $d $n)
+[Unit]
+Description=srv service $n of $d
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=$user
+Group=$user
+WorkingDirectory=$dir
+ExecStart=$SRV_RUN/$id.sh
+Restart=always
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=30
+StandardOutput=append:$log
+StandardError=append:$log
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+      run systemctl daemon-reload ;;
+    supervisor)
+      local autostart=false
+      if [[ $(srvc_get "$d" "$n" ACTIVE) == yes ]]; then autostart=true; fi
+      cat >"/etc/supervisor/conf.d/$unit.conf" <<EOF
+; Managed by srv — service '$n' of $d (srv service start|stop|restart $d $n)
+[program:$unit]
+command=$SRV_RUN/$id.sh
+directory=$dir
+user=$user
+autostart=$autostart
+autorestart=true
+startsecs=3
+startretries=5
+stopwaitsecs=30
+stopasgroup=true
+killasgroup=true
+redirect_stderr=true
+stdout_logfile=$log
+stdout_logfile_maxbytes=0
+environment=HOME="$home",USER="$user"
+EOF
+      ;;
+    pm2)
+      cat >"$SRV_RUN/$id.pm2.config.js" <<EOF
+// Managed by srv — service '$n' of $d (srv service start|stop|restart $d $n)
+module.exports = {
+  apps: [{
+    name: "$id",
+    script: "$SRV_RUN/$id.sh",
+    interpreter: "none",
+    cwd: "$dir",
+    out_file: "$log",
+    error_file: "$log",
+    merge_logs: true,
+    time: true,
+    autorestart: true,
+    restart_delay: 3000,
+    max_restarts: 15,
+    kill_timeout: 10000
+  }]
+};
+EOF
+      chmod 644 "$SRV_RUN/$id.pm2.config.js"
+      pm2_write_unit "$d" ;;
+  esac
+}
+
+srvc_pm_start() {
+  local d=$1 n=$2 unit id; unit=$(srvc_unit "$d" "$n"); id=$(srvc_id "$d" "$n")
+  case $(srvc_pm "$d" "$n") in
+    systemd)    run systemctl enable "$unit.service" && run systemctl restart "$unit.service" ;;
+    supervisor) sv_update || return 1; supervisorctl stop "$unit" >>"$SRV_LOG" 2>&1 || true; run supervisorctl start "$unit" ;;
+    pm2)
+      run systemctl enable "pm2-$(site_get "$d" SITE_USER).service" || true
+      run pm2_as "$d" startOrRestart "$SRV_RUN/$id.pm2.config.js" && run pm2_as "$d" save --force ;;
+  esac
+}
+
+srvc_pm_stop() {
+  local d=$1 n=$2 unit id; unit=$(srvc_unit "$d" "$n"); id=$(srvc_id "$d" "$n")
+  case $(srvc_pm "$d" "$n") in
+    systemd)    run systemctl disable --now "$unit.service" ;;
+    supervisor) supervisorctl stop "$unit" >>"$SRV_LOG" 2>&1 || true; sv_update ;;
+    pm2)        if pm2_alive "$d"; then pm2_as "$d" delete "$id" >>"$SRV_LOG" 2>&1 || true; run pm2_as "$d" save --force; fi ;;
+  esac
+}
+
+srvc_state() {
+  local d=$1 n=$2 unit id s pid; unit=$(srvc_unit "$d" "$n"); id=$(srvc_id "$d" "$n")
+  case $(srvc_pm "$d" "$n") in
+    systemd)
+      s=$(svc_state "$unit.service")
+      case $s in active) echo running ;; inactive|"") echo stopped ;; activating) echo starting ;; *) echo "$s" ;; esac ;;
+    supervisor)
+      s=$({ supervisorctl status "$unit" 2>/dev/null || true; } | awk 'NR==1 {print tolower($2)}')
+      echo "${s:-not loaded}" ;;
+    pm2)
+      if pm2_alive "$d"; then
+        pid=$({ pm2_as "$d" pid "$id" 2>/dev/null || true; } | tail -n 1)
+        if [[ $pid =~ ^[1-9][0-9]*$ ]]; then echo running; else echo stopped; fi
+      else echo stopped; fi ;;
+  esac
+}
+
+# srvc_pm_remove domain name manager — stop it and delete that manager's config.
+# The site user's PM2 daemon is only shut down when nothing else uses it.
+srvc_pm_remove() {
+  local d=$1 n=$2 pm=$3 unit id user; unit=$(srvc_unit "$d" "$n"); id=$(srvc_id "$d" "$n"); user=$(site_get "$d" SITE_USER)
+  case $pm in
+    systemd)
+      systemctl disable --now "$unit.service" >>"$SRV_LOG" 2>&1 || true
+      rm -f "/etc/systemd/system/$unit.service"
+      run systemctl daemon-reload || true ;;
+    supervisor)
+      supervisorctl stop "$unit" >>"$SRV_LOG" 2>&1 || true
+      rm -f "/etc/supervisor/conf.d/$unit.conf"
+      if command -v supervisorctl >/dev/null 2>&1; then sv_update || true; fi ;;
+    pm2)
+      if pm2_alive "$d"; then
+        pm2_as "$d" delete "$id" >>"$SRV_LOG" 2>&1 || true
+        pm2_as "$d" save --force >>"$SRV_LOG" 2>&1 || true
+      fi
+      rm -f "$SRV_RUN/$id.pm2.config.js"
+      if [[ $(app_pm "$d") != pm2 || ! $(site_get "$d" TYPE) =~ ^(node|python)$ ]] && ! srvc_any_pm2 "$d" "$n"; then
+        if pm2_alive "$d"; then pm2_as "$d" kill >>"$SRV_LOG" 2>&1 || true; fi
+        systemctl disable "pm2-$user.service" >>"$SRV_LOG" 2>&1 || true
+        rm -f "/etc/systemd/system/pm2-$user.service"
+        run systemctl daemon-reload || true
+      fi ;;
+  esac
+}
+
+srvc_wait() {
+  local d=$1 n=$2 port i; port=$(srvc_get "$d" "$n" PORT)
+  if [[ -z $port ]]; then sleep 2
+    if [[ $(srvc_state "$d" "$n") == running ]]; then ok "$d/$n is running"; return 0; fi
+    warn "$d/$n isn't running — check: srv service logs $d $n"; return 1
+  fi
+  for (( i = 0; i < 20; i++ )); do
+    if port_in_use "$port"; then ok "$d/$n is up on 127.0.0.1:$port"; return 0; fi
+    sleep 1
+  done
+  warn "$d/$n isn't listening on port $port yet — it must listen on \$PORT. Check: srv service logs $d $n"
+  return 1
+}
+
+srvc_start() {
+  local d=$1 n=$2 dir; dir=$(srvc_dir "$d" "$n")
+  [[ -d $dir ]] || die "The folder of $d/$n doesn't exist: $dir — upload the code (or deploy), then: srv service build $d $n"
+  case $(srvc_pm "$d" "$n") in pm2) ensure_feature node; ensure_feature pm2 ;; supervisor) ensure_feature supervisor ;; esac
+  srvc_set "$d" "$n" ACTIVE yes
+  srvc_render_launcher "$d" "$n"
+  srvc_pm_write "$d" "$n"
+  srvc_pm_start "$d" "$n" || die "Couldn't start $d/$n — see $SRV_LOG and: srv service logs $d $n"
+  srvc_wait "$d" "$n" || true
+}
+
+srvc_stop() {
+  local d=$1 n=$2
+  srvc_set "$d" "$n" ACTIVE no
+  srvc_pm_write "$d" "$n"
+  srvc_pm_stop "$d" "$n" || die "Couldn't stop $d/$n — see $SRV_LOG"
+  ok "$d/$n stopped (stays stopped after reboot — start with: srv service start $d $n)"
+}
+
+# Install dependencies (and run the build command) in the service folder
+srvc_build() {   # domain name [folder]
+  local d=$1 n=$2 dir=${3:-} rt cmd path py want
+  if [[ -z $dir ]]; then dir=$(srvc_dir "$d" "$n"); fi
+  [[ -d $dir ]] || die "The folder of $d/$n doesn't exist: $dir"
+  rt=$(srvc_get "$d" "$n" RUNTIME command)
+  path=$(srvc_path_env "$d" "$n" "$dir/.venv")
+  case $rt in
+    node)
+      [[ -x ${path%%:*}/node ]] || die "Node.js $(srvc_get "$d" "$n" NODE "$(cfg_get NODE_DEFAULT)") isn't installed — run: srv node install <version>"
+      cmd=$(srvc_get "$d" "$n" INSTALL_CMD)
+      if [[ -z $cmd && -f $dir/package.json ]]; then cmd=$(node_install_cmd "$dir"); fi
+      if [[ -n $cmd ]]; then
+        info "$n: installing dependencies ($cmd)"
+        app_exec "$d" "$cmd" "$dir" "$path" || die "$n: dependency install failed (see the output above)"
+      fi ;;
+    python)
+      py=python3; want=$(srvc_get "$d" "$n" PY_VERSION)
+      if [[ -n $want ]]; then [[ -x $PY_ROOT/$want/bin/python3 ]] || die "Python $want isn't installed — run: srv python install $want"; py=$PY_ROOT/$want/bin/python3; fi
+      if [[ ! -x $dir/.venv/bin/python ]]; then
+        info "$n: creating a virtualenv in $dir/.venv"
+        run runuser -u "$(site_get "$d" SITE_USER)" -- env -C "$dir" "$py" -m venv "$dir/.venv" || die "$n: couldn't create the virtualenv"
+      fi
+      app_exec "$d" "python -m pip install -q --upgrade pip wheel" "$dir" "$path" || die "$n: pip upgrade failed"
+      cmd=$(srvc_get "$d" "$n" INSTALL_CMD)
+      if [[ -z $cmd ]]; then
+        if [[ -f $dir/requirements.txt ]]; then cmd="pip install -r requirements.txt"
+        elif [[ -f $dir/pyproject.toml ]]; then cmd="pip install ."; fi
+      fi
+      if [[ -n $cmd ]]; then
+        info "$n: installing dependencies ($cmd)"
+        app_exec "$d" "$cmd" "$dir" "$path" || die "$n: dependency install failed (see the output above)"
+      fi ;;
+    *)
+      cmd=$(srvc_get "$d" "$n" INSTALL_CMD)
+      if [[ -n $cmd ]]; then info "$n: $cmd"; app_exec "$d" "$cmd" "$dir" "$path" || die "$n: install command failed"; fi ;;
+  esac
+  cmd=$(srvc_get "$d" "$n" BUILD_CMD)
+  if [[ -n $cmd ]]; then
+    info "$n: building ($cmd)"
+    app_exec "$d" "$cmd" "$dir" "$path" || die "$n: build failed (see the output above)"
+  fi
+}
+
+# Deploys: build every service inside the new release, before the switch
+srvc_build_release() {   # domain release-folder
+  local d=$1 rel=$2 n
+  while IFS= read -r n; do
+    [[ -n $n ]] || continue
+    if [[ ! -d $(srvc_dir "$d" "$n" "$rel") ]]; then
+      warn "Service $n: $(srvc_get "$d" "$n" DIR)/ isn't in this release — it keeps running the old code"
+      continue
+    fi
+    srvc_build "$d" "$n" "$(srvc_dir "$d" "$n" "$rel")"
+  done < <(srvc_names "$d")
+}
+
+# After a switch, rollback or rebuild: new config for every service, restart the active ones
+srvc_refresh_all() {   # domain [restart]
+  local d=$1 restart=${2:-yes} n
+  while IFS= read -r n; do
+    [[ -n $n ]] || continue
+    srvc_render_launcher "$d" "$n"
+    srvc_pm_write "$d" "$n"
+    if [[ $(srvc_get "$d" "$n" ACTIVE) == yes && $restart == yes ]]; then
+      if [[ -d $(srvc_dir "$d" "$n") ]]; then
+        if srvc_pm_start "$d" "$n"; then srvc_wait "$d" "$n" || true; else warn "Couldn't restart service $n — see: srv service logs $d $n"; fi
+      else
+        warn "Service $n: $(srvc_dir "$d" "$n") doesn't exist — not started"
+      fi
+    fi
+  done < <(srvc_names "$d")
+}
+
+# ── Nginx ────────────────────────────────────────────────────────────────────
+srvc_proxy_location() {   # domain name location → a proxy location block
+  local d=$1 n=$2 loc=$3 port ws timeout body target
+  port=$(srvc_get "$d" "$n" PORT); ws=$(srvc_get "$d" "$n" WEBSOCKET yes)
+  timeout=$(srvc_get "$d" "$n" TIMEOUT 60); body=$(srvc_get "$d" "$n" MAX_BODY)
+  if [[ $ws == yes ]] && (( timeout < 3600 )); then timeout=3600; fi
+  target="http://127.0.0.1:$port"
+  if [[ $loc != / && $(srvc_get "$d" "$n" STRIP no) == yes ]]; then target="$target/"; fi
+  echo "    location ^~ $loc {"
+  echo "        proxy_pass $target;"
+  echo "        include snippets/srv-proxy.conf;"
+  # shellcheck disable=SC2016
+  echo '        proxy_set_header Host $host;'
+  if [[ $ws == yes ]]; then
+    # shellcheck disable=SC2016
+    printf '        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n'
+  else
+    echo '        proxy_set_header Connection "";'
+  fi
+  echo "        proxy_read_timeout ${timeout}s;"
+  echo "        proxy_send_timeout ${timeout}s;"
+  if [[ -n $body ]]; then echo "        client_max_body_size $body;"; fi
+  echo "    }"
+}
+
+srvc_nginx_paths() {   # domain → locations for services reached at a path of the site
+  local d=$1 n
+  while IFS= read -r n; do
+    [[ -n $n && $(srvc_mode "$d" "$n") == path ]] || continue
+    echo
+    echo "    # Service '$n' — srv service info $d $n"
+    srvc_proxy_location "$d" "$n" "$(srvc_get "$d" "$n" ROUTE)"
+  done < <(srvc_names "$d")
+}
+
+srvc_render_vhost() {   # domain name → a server block for a service with its own domain
+  local d=$1 n=$2 sd ssl v6=0 nv h2_listen=" http2" h2_on=0
+  sd=$(srvc_get "$d" "$n" DOMAIN); ssl=$(srvc_get "$d" "$n" SSL no)
+  if [[ $ssl == yes && ! -f /etc/letsencrypt/live/$sd/fullchain.pem ]]; then warn "No certificate for $sd — serving HTTP only"; ssl=no; fi
+  if [[ -f /proc/net/if_inet6 ]]; then v6=1; fi
+  nv=$(nginx_version); if [[ -n $nv ]] && ver_ge "$nv" 1.25.1; then h2_listen=""; h2_on=1; fi
+  echo "# Managed by srv — service '$n' of $d (srv service info $d $n). Don't edit."
+  echo "server {"
+  echo "    listen 80;"
+  if (( v6 )); then echo "    listen [::]:80;"; fi
+  echo "    server_name $sd;"
+  echo "    include snippets/srv-acme.conf;"
+  if [[ $ssl == yes ]]; then
+    echo "    location / { return 301 https://\$host\$request_uri; }"
+    echo "}"
+    echo
+    echo "server {"
+    echo "    listen 443 ssl${h2_listen};"
+    if (( v6 )); then echo "    listen [::]:443 ssl${h2_listen};"; fi
+    if (( h2_on )); then echo "    http2 on;"; fi
+    echo "    server_name $sd;"
+    echo "    ssl_certificate     /etc/letsencrypt/live/$sd/fullchain.pem;"
+    echo "    ssl_certificate_key /etc/letsencrypt/live/$sd/privkey.pem;"
+    echo "    include snippets/srv-ssl.conf;"
+  fi
+  echo
+  echo "    access_log /var/log/nginx/$sd.access.log;"
+  echo "    error_log  /var/log/nginx/$sd.error.log warn;"
+  echo "    include snippets/srv-security.conf;"
+  srvc_proxy_location "$d" "$n" /
+  echo "}"
+}
+
+# Write/enable (or disable/remove) the vhosts of a site's domain services.
+# Called by site_apply_nginx before its config test.
+srvc_apply_vhosts() {   # domain
+  local d=$1 n f keep=" " name
+  while IFS= read -r n; do
+    [[ -n $n && $(srvc_mode "$d" "$n") == domain ]] || continue
+    f=$(srvc_vhost "$d" "$n"); keep+="$f "
+    srvc_render_vhost "$d" "$n" >"/etc/nginx/sites-available/$f"
+    if [[ $(site_get "$d" ENABLED yes) == yes ]]; then ln -sfn "/etc/nginx/sites-available/$f" "/etc/nginx/sites-enabled/$f"
+    else rm -f "/etc/nginx/sites-enabled/$f"; fi
+  done < <(srvc_names "$d")
+  for f in /etc/nginx/sites-available/srv-svc-"$d"--*.conf; do
+    [[ -f $f ]] || continue
+    name=$(basename "$f")
+    if [[ $keep != *" $name "* ]]; then rm -f "$f" "/etc/nginx/sites-enabled/$name"; fi
+  done
+}
+
+srvc_ssl() {   # domain name — Let's Encrypt for a service's own domain
+  local d=$1 n=$2 sd rc=0 email
+  [[ $(srvc_mode "$d" "$n") == domain ]] || die "$d/$n has no domain of its own (it's $(srvc_mode "$d" "$n"))."
+  ensure_feature certbot
+  sd=$(srvc_get "$d" "$n" DOMAIN)
+  dns_check "$sd" "$(server_ips)" || rc=$?
+  case $rc in
+    0) ok "$sd → this server" ;;
+    1) warn "$sd → $(dns_resolve "$sd" | tr '\n' ' ')(not this server — behind a proxy/CDN?)" ;;
+    2) err "$sd doesn't resolve yet — add a DNS A record pointing to this server, then: srv service ssl $d $n"; return 1 ;;
+  esac
+  install -d -m 755 "$ACME_ROOT"
+  local -a args=(certonly --webroot -w "$ACME_ROOT" --cert-name "$sd" -d "$sd" --non-interactive --agree-tos --keep-until-expiring)
+  email=$(cfg_get ADMIN_EMAIL)
+  if [[ -n $email ]]; then args+=(-m "$email"); else args+=(--register-unsafely-without-email); fi
+  info "Requesting a certificate for $sd"
+  run certbot "${args[@]}" || { err "Certificate request failed. Check that port 80 is open and DNS points to this server."; return 1; }
+  srvc_set "$d" "$n" SSL yes
+  site_apply_nginx "$d" || return 1
+  ok "HTTPS enabled: https://$sd"
+}
+
+srvc_url() {
+  local d=$1 n=$2 s=http
+  case $(srvc_mode "$d" "$n") in
+    path)   if [[ $(site_get "$d" SSL) == yes ]]; then s=https; fi; printf '%s://%s%s' "$s" "$d" "$(srvc_get "$d" "$n" ROUTE)" ;;
+    domain) if [[ $(srvc_get "$d" "$n" SSL) == yes ]]; then s=https; fi; printf '%s://%s/' "$s" "$(srvc_get "$d" "$n" DOMAIN)" ;;
+    *)      printf 'internal (no web address)' ;;
+  esac
+}
+
+# Everything of one service: process, launcher, vhost, certificate (with purge)
+srvc_remove_files() {   # domain name [purge]
+  local d=$1 n=$2 purge=${3:-0} sd
+  srvc_pm_remove "$d" "$n" "$(srvc_pm "$d" "$n")"
+  rm -f "$SRV_RUN/$(srvc_id "$d" "$n").sh" "$SRV_RUN/$(srvc_id "$d" "$n").pm2.config.js"
+  rm -f "/etc/nginx/sites-enabled/$(srvc_vhost "$d" "$n")" "/etc/nginx/sites-available/$(srvc_vhost "$d" "$n")"
+  sd=$(srvc_get "$d" "$n" DOMAIN)
+  if (( purge )) && [[ -n $sd && -d /etc/letsencrypt/live/$sd ]]; then
+    run certbot delete --cert-name "$sd" --non-interactive || warn "Couldn't delete the certificate for $sd"
+  fi
+}
+
+srvc_remove_all() {   # domain [purge] — used by site removal
+  local d=$1 purge=${2:-0} n user; user=$(site_get "$d" SITE_USER)
+  while IFS= read -r n; do
+    [[ -n $n ]] || continue
+    srvc_remove_files "$d" "$n" "$purge"
+  done < <(srvc_names "$d")
+  rm -rf "${SRV_SVCS:?}/${d:?}"
+  # The site is going away: its user's PM2 daemon isn't needed by anything any more
+  if [[ -f /etc/systemd/system/pm2-$user.service ]]; then
+    if pm2_alive "$d"; then pm2_as "$d" kill >>"$SRV_LOG" 2>&1 || true; fi
+    systemctl disable "pm2-$user.service" >>"$SRV_LOG" 2>&1 || true
+    rm -f "/etc/systemd/system/pm2-$user.service"
+    run systemctl daemon-reload || true
+  fi
+}
+
+# ── Commands ─────────────────────────────────────────────────────────────────
+srvc_resolve() {   # domain name → validated "domain name"
+  local d n=${2:-}
+  d=$(resolve_domain "${1:-}") || exit 1
+  if [[ -z $n ]]; then
+    local -a items=(); local x
+    while IFS= read -r x; do if [[ -n $x ]]; then items+=("$x" "$(srvc_mode "$d" "$x") · $(srvc_get "$d" "$x" START_CMD)"); fi; done < <(srvc_names "$d")
+    (( ${#items[@]} )) || die "$d has no services (add one with: srv service add $d <name>)"
+    (( INTERACTIVE )) || die "Name the service: srv service <command> $d <name>   (services: $(srvc_names "$d" | tr '\n' ' '))"
+    n=$(ui_menu "Services of $d" "Which service?" "${items[@]}") || die "Cancelled."
+  fi
+  srvc_exists "$d" "$n" || die "$d has no service named $n (services: $(srvc_names "$d" | tr '\n' ' '))"
+  printf '%s %s\n' "$d" "$n"
+}
+
+srvc_valid_route() { [[ $1 =~ ^/[A-Za-z0-9._~@-]+(/[A-Za-z0-9._~@-]+)*/$ ]]; }
+
+srvc_add() {
+  local d="" n="" dir="" dir_set=0 rt="" start="" install="" build="" node="" py="" pm="" port="" mode="" route="" sd=""
+  local ws="" strip=no ssl="" timeout="" nobuild=0 nostart=0
+  local -a pos=()
+  while (( $# )); do
+    case $1 in
+      --dir)        need_val "$@"; dir=$2; dir_set=1; shift 2 ;;
+      --runtime)    need_val "$@"; rt=$2; shift 2 ;;
+      --start)      need_val "$@"; start=$2; shift 2 ;;
+      --install)    need_val "$@"; install=$2; shift 2 ;;
+      --build)      need_val "$@"; build=$2; shift 2 ;;
+      --node)       need_val "$@"; node=$2; shift 2 ;;
+      --python)     need_val "$@"; py=$2; shift 2 ;;
+      --pm)         need_val "$@"; pm=$2; shift 2 ;;
+      --port)       need_val "$@"; port=$2; shift 2 ;;
+      --path)       need_val "$@"; mode=path; route=$2; shift 2 ;;
+      --strip)      strip=yes; shift ;;
+      --domain)     need_val "$@"; mode=domain; sd=${2,,}; shift 2 ;;
+      --internal)   mode=internal; shift ;;
+      --websocket)  ws=yes; shift ;;
+      --no-websocket) ws=no; shift ;;
+      --timeout)    need_val "$@"; timeout=$2; shift 2 ;;
+      --ssl)        ssl=yes; shift ;;
+      --no-ssl)     ssl=no; shift ;;
+      --no-build)   nobuild=1; shift ;;
+      --no-start)   nostart=1; shift ;;
+      -*) die "Unknown option: $1 (see: srv help)" ;;
+      *)  pos+=("$1"); shift ;;
+    esac
+  done
+  d=${pos[0]:-}; n=${pos[1]:-}
+  d=$(resolve_domain "$d") || exit 1
+  [[ $(site_get "$d" TYPE) != proxy ]] || die "$d is a proxy site — it has no code to run services from."
+  if [[ -z $n ]]; then n=$(ui_input "Service name (lowercase, e.g. socket, worker, bot)" "") || die "Cancelled."; fi
+  n=${n,,}
+  [[ $n =~ ^[a-z][a-z0-9-]{0,23}$ ]] || die "Service names use lowercase letters, digits and dashes (max 24), starting with a letter."
+  if srvc_exists "$d" "$n"; then die "$d already has a service named $n (see: srv service info $d $n)"; fi
+
+  # Folder inside the site's code
+  if (( ! dir_set )); then
+    dir=$n
+    if [[ ! -d $(site_get "$d" APP_DIR)/$dir ]] && (( INTERACTIVE )); then
+      dir=$(ui_input "Folder inside $(site_get "$d" APP_DIR) to run it from (blank = the app folder itself)" "$dir" empty) || die "Cancelled."
+    fi
+  fi
+  dir=${dir#/}; dir=${dir%/}; dir=${dir#./}
+  if [[ -n $dir ]]; then valid_relpath "$dir" || die "Invalid folder: $dir"; fi
+  local live; live="$(site_get "$d" APP_DIR)${dir:+/$dir}"
+  if [[ ! -d $live ]]; then
+    if [[ $(site_get "$d" DEPLOY) == yes ]]; then warn "$live doesn't exist yet — it will be built and started with the next deploy that contains it"
+    else warn "$live doesn't exist yet — upload the code, then: srv service build $d $n"; fi
+    nobuild=1; nostart=1
+  fi
+
+  # Runtime and command
+  if [[ -z $rt ]]; then
+    if [[ -f $live/package.json ]]; then rt=node
+    elif [[ -f $live/requirements.txt || -f $live/pyproject.toml ]]; then rt=python
+    elif (( INTERACTIVE )); then
+      rt=$(ui_menu "Service $n" "What runs it?" node "Node.js" python "Python (own virtualenv)" command "Any other command (a binary, php, …)") || die "Cancelled."
+    else rt="command"; fi
+  fi
+  in_list "$rt" node python command || die "Runtime must be node, python or command."
+  if [[ $rt == node ]]; then
+    ensure_feature node
+    if [[ -n $node ]]; then
+      local -a _nv=(); mapfile -t _nv < <(node_versions)
+      in_list "$node" "${_nv[@]}" || die "Node.js $node isn't installed (installed: ${_nv[*]}) — srv node install $node"
+    fi
+  fi
+  if [[ $rt == python ]]; then
+    ensure_feature python
+    if [[ -n $py && ! -x $PY_ROOT/$py/bin/python3 ]]; then die "Python $py isn't installed — run: srv python install $py"; fi
+  fi
+  if [[ -z $start ]]; then
+    local def=""
+    if [[ $rt == node && -f $live/package.json ]] && grep -qE '"start"[[:space:]]*:' "$live/package.json"; then def="npm start"; fi
+    if [[ -n $def ]] && (( ! INTERACTIVE || ASSUME_YES )); then start=$def
+    else
+      (( INTERACTIVE )) || die "Add --start \"<command>\" (e.g. --start \"node server.js\")"
+      start=$(ui_input "Start command, run in $live (e.g. node server.js, python worker.py)" "$def") || die "Cancelled."
+    fi
+  fi
+  [[ -n $start && $start != *$'\n'* ]] || die "The start command must be a single line."
+
+  # How it's reached
+  if [[ -z $mode ]]; then
+    if (( INTERACTIVE && ! ASSUME_YES )); then
+      mode=$(ui_menu "Service $n" "How should it be reached?" \
+        path     "At a path of $d (e.g. /socket.io/ — same domain, no CORS)" \
+        domain   "On its own domain (e.g. socket.$d)" \
+        internal "Not from the web (a worker, a bot, a queue consumer)") || die "Cancelled."
+    else mode=internal; fi
+    case $mode in
+      path)   route=$(ui_input "Path, e.g. /socket.io/ or /api/" "/$n/") || die "Cancelled." ;;
+      domain) sd=$(ui_input "Domain for $n (its DNS must point here for HTTPS)" "$n.$d") || die "Cancelled."; sd=${sd,,} ;;
+    esac
+  fi
+  if [[ $mode == path ]]; then
+    [[ $route == /* ]] || route="/$route"
+    [[ $route == */ ]] || route="$route/"
+    srvc_valid_route "$route" || die "Invalid path: $route (use letters, digits, - . _ ~ @, e.g. /socket.io/)"
+    case $route in /.well-known/*|/_srv*|/__srv*) die "$route is reserved by srv." ;; esac
+    local x
+    while IFS= read -r x; do
+      if [[ -n $x && $(srvc_mode "$d" "$x") == path && $(srvc_get "$d" "$x" ROUTE) == "$route" ]]; then die "$route is already used by service $x."; fi
+    done < <(srvc_names "$d")
+  fi
+  if [[ $mode == domain ]]; then
+    valid_domain "$sd" || die "Invalid domain: $sd"
+    if site_exists "$sd"; then die "$sd is a site already."; fi
+    local owner; if owner=$(domain_in_use "$sd"); then die "$sd is an alias of site $owner."; fi
+    if owner=$(srvc_domain_owner "$sd"); then die "$sd is already used by service $owner."; fi
+  fi
+  if [[ $mode != internal ]]; then
+    if [[ -n $port ]]; then
+      port=$(dec "$port"); valid_port "$port" || die "Port must be 1024–65535"
+      if port_used_by_site "$port" || port_in_use "$port"; then die "Port $port is already in use"; fi
+    else port=$(port_alloc) || die "No free port found."; fi
+  else
+    if [[ -n $port ]]; then port=$(dec "$port"); valid_port "$port" || die "Port must be 1024–65535"; fi
+  fi
+  if [[ -n $timeout ]]; then timeout=$(dec "$timeout"); [[ $timeout =~ ^[0-9]+$ ]] && (( timeout >= 1 && timeout <= 86400 )) || die "Timeout is in seconds (1–86400)"; fi
+  pm=${pm:-systemd}; in_list "$pm" systemd pm2 supervisor || die "--pm must be systemd, pm2 or supervisor"
+
+  # Save
+  install -d -m 700 "$SRV_SVCS/$d"
+  {
+    echo "# srv service config — change with: srv service set $d $n KEY value"
+    printf '%s\n' "DIR=$dir" "RUNTIME=$rt" "START_CMD=$start" "INSTALL_CMD=$install" "BUILD_CMD=$build" \
+      "NODE=$node" "PY_VERSION=$py" "PM=$pm" "MODE=$mode" "ROUTE=$route" "STRIP=$strip" "DOMAIN=$sd" \
+      "PORT=$port" "WEBSOCKET=${ws:-yes}" "TIMEOUT=${timeout:-60}" "MAX_BODY=" "SSL=no" "ACTIVE=no"
+  } >"$(srvc_file "$d" "$n")"
+  chmod 600 "$(srvc_file "$d" "$n")"
+  ok "Service $n added to $d ($rt, $pm, $(srvc_url "$d" "$n"))"
+
+  # Nginx first: if it rejects the config, nothing else is left behind
+  if [[ $mode != internal ]]; then
+    if ! site_apply_nginx "$d"; then
+      rm -f "$(srvc_file "$d" "$n")"; site_apply_nginx "$d" || true
+      die "Nginx rejected the config — the service wasn't added. Is $route already used by the site?"
+    fi
+  fi
+  if (( ! nobuild )); then
+    site_fix_perms "$d" >/dev/null 2>&1 || true
+    srvc_build "$d" "$n"
+  fi
+  if (( ! nostart )); then srvc_start "$d" "$n"; fi
+  if [[ $mode == domain ]]; then
+    if [[ -z $ssl ]]; then
+      if (( INTERACTIVE && ! ASSUME_YES )); then
+        if ui_yesno "Issue a Let's Encrypt certificate for $sd now? (its DNS must already point here)" yes; then ssl=yes; else ssl=no; fi
+      else ssl=no; fi
+    fi
+    if [[ $ssl == yes ]]; then srvc_ssl "$d" "$n" || warn "HTTPS isn't set up yet — fix DNS, then run: srv service ssl $d $n"; fi
+  fi
+  echo
+  srvc_info "$d" "$n"
+}
+
+srvc_info() {
+  local d=$1 n=$2 home
+  home=$(site_get "$d" HOME_DIR)
+  printf '  %-12s %s\n' \
+    "Service" "$n (site $d)" \
+    "Address" "$(srvc_url "$d" "$n")$( [[ $(srvc_mode "$d" "$n") == path && $(srvc_get "$d" "$n" STRIP) == yes ]] && echo "  (prefix stripped)")" \
+    "Folder" "$(srvc_dir "$d" "$n")" \
+    "Runtime" "$(srvc_get "$d" "$n" RUNTIME)$( [[ $(srvc_get "$d" "$n" RUNTIME) == node ]] && echo " $(srvc_get "$d" "$n" NODE "$(cfg_get NODE_DEFAULT)") (Node.js)")$( [[ $(srvc_get "$d" "$n" RUNTIME) == python ]] && echo " $(srvc_get "$d" "$n" PY_VERSION system) (venv: <folder>/.venv)")" \
+    "Start" "$(srvc_get "$d" "$n" START_CMD)" \
+    "Install" "$(x=$(srvc_get "$d" "$n" INSTALL_CMD); echo "${x:-auto}")" \
+    "Build" "$(x=$(srvc_get "$d" "$n" BUILD_CMD); echo "${x:-none}")" \
+    "Manager" "$(srvc_pm "$d" "$n")" \
+    "Port" "$(x=$(srvc_get "$d" "$n" PORT); echo "${x:-none}")" \
+    "WebSocket" "$(srvc_get "$d" "$n" WEBSOCKET yes)" \
+    "State" "$(srvc_state "$d" "$n")$( [[ $(srvc_get "$d" "$n" ACTIVE) == yes ]] || echo " (not enabled)")" \
+    "Log" "$(srvc_log "$d" "$n")" \
+    "Env files" "$home/app.env, $home/svc-$n.env"
+}
+
+srvc_list() {   # [domain]
+  local -a doms=(); local d n any=0 state port
+  if [[ -n ${1:-} ]]; then doms=("$(resolve_domain "$1")") || exit 1; else mapfile -t doms < <(site_list_domains); fi
+  printf '%s%-28s %-12s %-8s %-11s %-6s %-10s %s%s\n' "$C_BOLD" SITE SERVICE RUNTIME MANAGER PORT STATE ADDRESS "$C_0"
+  for d in "${doms[@]}"; do
+    [[ -n $d ]] || continue
+    while IFS= read -r n; do
+      [[ -n $n ]] || continue
+      any=1; state=$(srvc_state "$d" "$n"); port=$(srvc_get "$d" "$n" PORT)
+      if [[ $state == running && -n $port ]] && ! port_in_use "$port"; then state="running*"; fi
+      printf '%-28s %-12s %-8s %-11s %-6s %-10s %s\n' "$d" "$n" "$(srvc_get "$d" "$n" RUNTIME)" "$(srvc_pm "$d" "$n")" "${port:--}" "$state" "$(srvc_url "$d" "$n")"
+    done < <(srvc_names "$d")
+  done
+  if (( ! any )); then echo "  (no services — add one with: srv service add <domain> <name> --dir <folder> --start \"<command>\")"; fi
+}
+
+srvc_set_cmd() {   # domain name KEY value
+  local d n k=${3:-} v
+  [[ $# -ge 4 && -n $k ]] || die "Usage: srv service set <domain> <name> <KEY> <value>   Keys: DIR START_CMD INSTALL_CMD BUILD_CMD NODE PY_VERSION PORT ROUTE STRIP WEBSOCKET TIMEOUT MAX_BODY"
+  read -r d n < <(srvc_resolve "$1" "$2") || exit 1
+  v=$4; k=${k^^}
+  in_list "$k" DIR START_CMD INSTALL_CMD BUILD_CMD NODE PY_VERSION PORT ROUTE STRIP WEBSOCKET TIMEOUT MAX_BODY \
+    || die "Editable keys: DIR START_CMD INSTALL_CMD BUILD_CMD NODE PY_VERSION PORT ROUTE STRIP WEBSOCKET TIMEOUT MAX_BODY (to change how it's reached, remove and re-add it)"
+  [[ $v != *$'\n'* ]] || die "The value must be a single line."
+  case $k in
+    DIR)        v=${v#/}; v=${v%/}; if [[ -n $v ]]; then valid_relpath "$v" || die "Invalid folder"; fi ;;
+    START_CMD)  [[ -n $v ]] || die "The start command can't be empty." ;;
+    NODE)       if [[ -n $v ]]; then local -a _nv=(); mapfile -t _nv < <(node_versions); in_list "$v" "${_nv[@]}" || die "Node.js $v isn't installed"; fi ;;
+    PY_VERSION) if [[ $v == system ]]; then v=""; fi; if [[ -n $v && ! -x $PY_ROOT/$v/bin/python3 ]]; then die "Python $v isn't installed"; fi ;;
+    PORT)       v=$(dec "$v"); valid_port "$v" || die "Port must be 1024–65535"
+                if [[ $v != "$(srvc_get "$d" "$n" PORT)" ]] && { port_used_by_site "$v" || port_in_use "$v"; }; then die "Port $v is already in use"; fi ;;
+    ROUTE)      [[ $(srvc_mode "$d" "$n") == path ]] || die "Only services reached at a path have a ROUTE."
+                [[ $v == /* ]] || v="/$v"; [[ $v == */ ]] || v="$v/"; srvc_valid_route "$v" || die "Invalid path: $v" ;;
+    STRIP|WEBSOCKET) in_list "$v" yes no || die "Use yes or no" ;;
+    TIMEOUT)    v=$(dec "$v"); [[ $v =~ ^[0-9]+$ ]] && (( v >= 1 && v <= 86400 )) || die "Timeout is in seconds (1–86400)" ;;
+    MAX_BODY)   [[ -z $v || $v =~ ^[0-9]+[kKmMgG]?$ ]] || die "Use a size like 100m" ;;
+  esac
+  srvc_set "$d" "$n" "$k" "$v"
+  ok "$d/$n: $k=$v"
+  case $k in
+    ROUTE|STRIP|WEBSOCKET|TIMEOUT|MAX_BODY|PORT) site_apply_nginx "$d" || die "Nginx update failed" ;;
+  esac
+  case $k in
+    INSTALL_CMD|BUILD_CMD) info "Applies from the next build: srv service build $d $n" ;;
+    NODE|PY_VERSION)       info "Rebuild to switch: srv service build $d $n" ;;
+    *) if [[ $(srvc_get "$d" "$n" ACTIVE) == yes ]]; then srvc_start "$d" "$n"; fi ;;
+  esac
+}
+
+srvc_remove() {   # domain name
+  local d=$1 n=$2 mode
+  if (( ! ASSUME_YES )); then ui_yesno "Remove service $n from $d? (its code stays in $(srvc_dir "$d" "$n"))" no || die "Cancelled."; fi
+  mode=$(srvc_mode "$d" "$n")
+  srvc_remove_files "$d" "$n" 0
+  rm -f "$(srvc_file "$d" "$n")"
+  rmdir "$SRV_SVCS/$d" 2>/dev/null || true
+  if [[ $mode != internal ]]; then site_apply_nginx "$d" || warn "Nginx update failed — check: nginx -t"; fi
+  ok "Service $n removed from $d (the code, its log and any certificate are kept)"
+}
+
+cmd_service() {
+  local sub=${1:-list}; shift || true
+  local d n
+  case $sub in
+    list|ls)  srvc_list "${1:-}" ;;
+    add|new)  srvc_add "$@" ;;
+    info|show) read -r d n < <(srvc_resolve "${1:-}" "${2:-}") || exit 1; echo; srvc_info "$d" "$n" ;;
+    set)      srvc_set_cmd "$@" ;;
+    start)    read -r d n < <(srvc_resolve "${1:-}" "${2:-}") || exit 1; srvc_start "$d" "$n" ;;
+    restart)  read -r d n < <(srvc_resolve "${1:-}" "${2:-}") || exit 1; srvc_start "$d" "$n" ;;
+    stop)     read -r d n < <(srvc_resolve "${1:-}" "${2:-}") || exit 1; srvc_stop "$d" "$n" ;;
+    status)   read -r d n < <(srvc_resolve "${1:-}" "${2:-}") || exit 1; echo "$d/$n: $(srvc_state "$d" "$n") ($(srvc_pm "$d" "$n")$( [[ -n $(srvc_get "$d" "$n" PORT) ]] && echo ", port $(srvc_get "$d" "$n" PORT)"))" ;;
+    build)
+      read -r d n < <(srvc_resolve "${1:-}" "${2:-}") || exit 1
+      if [[ $(site_get "$d" DEPLOY) == yes ]]; then info "$d deploys from git — building in the live release (the next deploy builds it too)"; fi
+      site_fix_perms "$d" >/dev/null 2>&1 || true
+      srvc_build "$d" "$n"
+      ok "Build finished"
+      srvc_start "$d" "$n" ;;
+    logs|log)
+      read -r d n < <(srvc_resolve "${1:-}" "${2:-}") || exit 1
+      if (( MENU_MODE )); then tail -n 100 "$(srvc_log "$d" "$n")"; else exec tail -n 100 -f "$(srvc_log "$d" "$n")"; fi ;;
+    exec|run)
+      read -r d n < <(srvc_resolve "${1:-}" "${2:-}") || exit 1
+      [[ -n ${3:-} ]] || die "Usage: srv service exec <domain> <name> '<command>'"
+      app_exec "$d" "$3" "$(srvc_dir "$d" "$n")" "$(srvc_path_env "$d" "$n")" ;;
+    ssl)      read -r d n < <(srvc_resolve "${1:-}" "${2:-}") || exit 1; srvc_ssl "$d" "$n" ;;
+    manager|pm)
+      read -r d n < <(srvc_resolve "${1:-}" "${2:-}") || exit 1
+      local new=${3:-} old active
+      old=$(srvc_pm "$d" "$n")
+      if [[ -z $new ]]; then new=$(ui_menu "Process manager" "$d/$n uses $old. Switch to:" systemd systemd pm2 PM2 supervisor Supervisor) || die "Cancelled."; fi
+      in_list "$new" systemd pm2 supervisor || die "Use systemd, pm2 or supervisor."
+      if [[ $new == "$old" ]]; then info "$d/$n already uses $old."; return 0; fi
+      active=$(srvc_get "$d" "$n" ACTIVE no)
+      srvc_pm_remove "$d" "$n" "$old"
+      srvc_set "$d" "$n" PM "$new"
+      if [[ $active == yes ]]; then srvc_start "$d" "$n"; else srvc_pm_write "$d" "$n"; fi
+      ok "$d/$n now runs under $new" ;;
+    remove|rm|delete)
+      read -r d n < <(srvc_resolve "${1:-}" "${2:-}") || exit 1; srvc_remove "$d" "$n" ;;
+    ""|menu)  menu_services ;;
+    *) die "Unknown service command: $sub (see: srv help)" ;;
+  esac
+}
+
+menu_services() {
+  local c d n
+  while true; do
+    c=$(ui_menu "Services" "Extra processes inside a site's code (socket servers, workers, bots):" \
+      list    "List all services" \
+      add     "Add a service to a site" \
+      info    "Service details" \
+      restart "Restart a service" \
+      stop    "Stop a service" \
+      build   "Install dependencies and restart" \
+      logs    "Recent log output" \
+      remove  "Remove a service" \
+      back    "Back") || return 0
+    ui_clear
+    case $c in
+      back) return 0 ;;
+      list) srvc_list ;;
+      add)  if d=$(pick_site); then try srvc_add "$d"; fi ;;
+      *)    if d=$(pick_site); then try cmd_service "$c" "$d"; fi ;;
+    esac
+    pause
+  done
 }
 
 # =============================================================================
@@ -4452,6 +5280,7 @@ deploy_build() {
     info "Build command: $cmd"
     app_exec "$d" "$cmd" "$rel" "$path" || die "Build command failed"
   fi
+  srvc_build_release "$d" "$rel"
 }
 
 deploy_migrate() {
@@ -4502,6 +5331,7 @@ deploy_reload() {
     node|python)
       app_start "$d" ;;
   esac
+  srvc_refresh_all "$d"
 }
 
 deploy_health() {
@@ -5795,6 +6625,20 @@ run_checks() {
       if [[ $st == running ]] && port_in_use "$(site_get "$d" PORT)"; then chk ok "app $d" "running ($(app_pm "$d"))"
       else chk fail "app $d" "$st, port $(site_get "$d" PORT) $(port_in_use "$(site_get "$d" PORT)" && echo open || echo closed)"; fi
     fi
+    local sn sp
+    while IFS= read -r sn; do
+      [[ -n $sn && $(srvc_get "$d" "$sn" ACTIVE) == yes ]] || continue
+      st=$(srvc_state "$d" "$sn"); sp=$(srvc_get "$d" "$sn" PORT)
+      if [[ $st == running ]] && { [[ -z $sp ]] || port_in_use "$sp"; }; then chk ok "service $d/$sn" "running ($(srvc_pm "$d" "$sn"))"
+      else chk fail "service $d/$sn" "$st${sp:+, port $sp $(port_in_use "$sp" && echo open || echo closed)}"; fi
+      if [[ $(srvc_mode "$d" "$sn") == domain && $(srvc_get "$d" "$sn" SSL) == yes ]]; then
+        if days=$(cert_days_left "$(srvc_get "$d" "$sn" DOMAIN)"); then
+          if (( days < 3 )); then chk fail "cert $(srvc_get "$d" "$sn" DOMAIN)" "expires in $days days"
+          elif (( days < 14 )); then chk warn "cert $(srvc_get "$d" "$sn" DOMAIN)" "expires in $days days"
+          else chk ok "cert $(srvc_get "$d" "$sn" DOMAIN)" "$days days left"; fi
+        else chk fail "cert $(srvc_get "$d" "$sn" DOMAIN)" "certificate missing"; fi
+      fi
+    done < <(srvc_names "$d")
     if [[ -f $(laravel_conf "$d") ]]; then
       st=$(laravel_state "$d")
       if [[ $st =~ ^([0-9]+)/([0-9]+)\ running$ && ${BASH_REMATCH[1]} == "${BASH_REMATCH[2]}" ]]; then chk ok "workers $d" "$st"
@@ -6403,7 +7247,8 @@ backup_one_site() {
     echo "SRV_VERSION=$SRV_VERSION"
   } >"$tmpd/srv-backup.info"
   cp "$(site_file "$d")" "$tmpd/srv-site.conf"
-  local -a extra=(srv-backup.info srv-site.conf nginx-custom)
+  local -a extra=(srv-backup.info srv-site.conf nginx-custom srv-services)
+  if [[ -d $SRV_SVCS/$d ]]; then cp -a "$SRV_SVCS/$d" "$tmpd/srv-services"; else mkdir "$tmpd/srv-services"; fi
   if [[ -n $cur && -f $(deploy_meta "$d" "$cur") ]]; then cp "$(deploy_meta "$d" "$cur")" "$tmpd/srv-release.meta"; extra+=(srv-release.meta); fi
   if [[ -d $NGINX_CUSTOM/$d ]]; then cp -a "$NGINX_CUSTOM/$d" "$tmpd/nginx-custom"; else mkdir "$tmpd/nginx-custom"; fi
   dir="$BACKUP_DIR/files/$d"; install -d -m 700 "$BACKUP_DIR" "$BACKUP_DIR/files" "$dir"
@@ -6584,6 +7429,24 @@ backup_restore_site() {
   if [[ -d $tmpd/nginx-custom ]] && [[ -n $(ls -A "$tmpd/nginx-custom" 2>/dev/null) ]]; then
     install -d -m 755 "$NGINX_CUSTOM/$d"; cp -a "$tmpd/nginx-custom/." "$NGINX_CUSTOM/$d/"
   fi
+  # Services (srv service): taken over when this server has none for the site yet
+  if [[ -n $(ls -A "$tmpd/srv-services" 2>/dev/null) && -z $(srvc_names "$d") ]]; then
+    local sf sn sp
+    install -d -m 700 "$SRV_SVCS/$d"
+    for sf in "$tmpd/srv-services"/*.conf; do
+      [[ -f $sf ]] || continue
+      sn=$(basename "$sf" .conf); sp=$(kv_get "$sf" PORT)
+      if [[ -n $sp ]] && { port_used_by_site "$sp" || port_in_use "$sp"; }; then sp=$(port_alloc) || sp=""; kv_set "$sf" PORT "$sp"; fi
+      if [[ -n $(kv_get "$sf" DOMAIN) ]] && { site_exists "$(kv_get "$sf" DOMAIN)" || srvc_domain_owner "$(kv_get "$sf" DOMAIN)" >/dev/null; }; then
+        warn "Service $sn: its domain $(kv_get "$sf" DOMAIN) is taken on this server — not restored"; continue
+      fi
+      install -m 600 "$sf" "$(srvc_file "$d" "$sn")"
+      if [[ $(kv_get "$sf" SSL) == yes && ! -d /etc/letsencrypt/live/$(kv_get "$sf" DOMAIN) ]]; then
+        srvc_set "$d" "$sn" SSL no; info "Service $sn: get its certificate here with: srv service ssl $d $sn"
+      fi
+      ok "Service $sn restored"
+    done
+  fi
   chown -R "$user:$user" "$home"
   ok "Files restored"
 
@@ -6637,6 +7500,7 @@ backup_restore_site() {
   # 4. Go live
   if [[ $adeploy == yes ]]; then
     deploy_switch "$d" "$arel"
+    site_apply_nginx "$d" || warn "Nginx update had problems — check: srv site rebuild $d"   # restored services / custom config
   else
     site_rebuild "$d" || warn "Rebuild had problems — check: srv site rebuild $d"
     if is_app_type "$type" && [[ $(site_get "$d" APP_ACTIVE) == yes ]]; then app_start "$d" || true; fi
@@ -6875,6 +7739,7 @@ cmd_status() {
   local has_apps=0
   while IFS= read -r d; do if [[ -n $d ]] && site_has_process "$d"; then has_apps=1; break; fi; done < <(site_list_domains)
   if (( has_apps )); then echo; printf '%sApps%s\n' "$C_BOLD" "$C_0"; app_list; fi
+  if [[ -n $(find "$SRV_SVCS" -name '*.conf' -print -quit 2>/dev/null) ]]; then echo; printf '%sSite services%s\n' "$C_BOLD" "$C_0"; srvc_list; fi
   if [[ -f /var/run/reboot-required ]]; then echo; warn "A reboot is required to finish updates."; fi
   echo
 }
@@ -6890,6 +7755,7 @@ main_menu() {
     c=$(ui_menu "srv $SRV_VERSION — $(hostname)" "What would you like to do?" \
       sites   "Sites — add, list, SSL, logs, remove …" \
       apps    "Apps — Node.js / Python processes, Laravel workers" \
+      services "Services — socket servers, workers, bots inside a site" \
       deploy  "Deploy — git releases, rollback, webhooks" \
       dashboard "Live dashboard" \
       check   "Health check & alerts" \
@@ -6908,6 +7774,7 @@ main_menu() {
       quit)    break ;;
       sites)   try menu_sites; continue ;;
       apps)    try menu_apps; continue ;;
+      services) try menu_services; continue ;;
       deploy)  try menu_deploy; continue ;;
       dashboard) try cmd_dashboard; continue ;;
       check)   try menu_check; continue ;;
@@ -7239,6 +8106,20 @@ Admin
   self-update [URL|file]       Update srv to the latest version from GitHub (or a given URL/file;
                                syntax-checked first, previous version kept as a backup)
 
+Services (extra processes inside a site's code: socket servers, workers, bots …)
+  service list [domain]
+  service add <domain> <name> [--dir <folder>] [--start "<cmd>"] [--runtime node|python|command]
+                         reach it: --path /socket.io/ [--strip] · --domain socket.example.com [--ssl] · --internal
+                         also: --node 22 --python 3.12 --pm systemd|pm2|supervisor --port N --install "<cmd>"
+                               --build "<cmd>" --websocket|--no-websocket --timeout N --no-build --no-start
+  service info|status|start|stop|restart|logs <domain> <name>
+  service build <domain> <name>      Install dependencies, build, (re)start
+  service set <domain> <name> <KEY> <value>   (START_CMD, DIR, PORT, ROUTE, STRIP, NODE, TIMEOUT …)
+  service exec <domain> <name> '<cmd>'
+  service ssl <domain> <name>        Certificate for a service on its own domain
+  service manager <domain> <name> [systemd|pm2|supervisor]
+  service remove <domain> <name>
+
 Deploy (git)
   deploy setup <domain> [--repo URL] [--branch main] [--keep 5] [--no-deploy]
   deploy <domain> [--ref <branch|tag|commit>] [--maintenance] [--no-migrate]
@@ -7320,6 +8201,9 @@ main() {
     app)
       case ${1:-} in list|ls|status|logs|log) ;; *) acquire_lock ;; esac
       cmd_app "$@" ;;
+    service|services|svc)
+      case ${1:-list} in list|ls|info|show|status|logs|log) ;; *) acquire_lock ;; esac
+      cmd_service "$@" ;;
     deploy)
       case ${1:-} in
         releases|list|ls|log|logs|key) ;;

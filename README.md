@@ -17,6 +17,9 @@ script it from the command line, CI or cron.
   Redis, and HTTPS.
 - **Apps**: run under systemd, PM2 or Supervisor, all managed with the same
   `srv app` commands. Laravel queue workers, Horizon and Reverb are included.
+- **Services**: extra processes inside any site's code (a socket.io server in
+  `socket/`, a worker, a bot), reached at a path such as `/socket.io/`, on their
+  own domain, or not at all, and updated together with the site on every deploy.
 - **Git deploys**: each deploy builds a new release, switches to it in one
   atomic step, and rolls back automatically if the site fails its health
   check. Webhooks for GitHub, GitLab and Bitbucket, plus maintenance mode.
@@ -163,6 +166,7 @@ message.
 | Server | `setup`, `install [feature] [version]`, `status`, `dashboard`, `check`, `self-update` |
 | Sites | `site add\|list\|info\|set\|enable\|disable\|rebuild\|fix-perms\|apply-env\|workers\|redis\|maintenance\|rollback\|logs\|remove` |
 | Apps | `app list\|build\|start\|stop\|restart\|status\|logs\|exec\|manager` |
+| Services | `service list\|add\|info\|start\|stop\|restart\|status\|logs\|build\|set\|exec\|ssl\|manager\|remove` |
 | Deploy | `deploy <domain>`, `deploy setup\|releases\|rollback\|webhook\|key\|log` |
 | Databases | `db create\|list\|drop\|password` (`--mysql` / `--pg`) |
 | Backups | `backup run\|db\|site\|list\|restore\|restore-db\|remote …` |

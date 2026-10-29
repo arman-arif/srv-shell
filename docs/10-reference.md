@@ -75,6 +75,22 @@ confirmations), `--plain` (plain text prompts). `srv version` prints the version
 | `srv app exec <domain> '<cmd>'` | Run a command as the site user, with its environment |
 | `srv app manager <domain> [systemd\|pm2\|supervisor]` | Switch process manager |
 
+## Services
+
+| Command | What it does |
+|---|---|
+| `srv service list [domain]` | Services of all sites, or of one |
+| `srv service add <domain> <name> [options]` | Add a service ([options](03-apps.md#all-options-for-service-add)): `--dir`, `--start`, `--runtime`, `--path P [--strip]` / `--domain D [--ssl]` / `--internal`, `--node`, `--python`, `--pm`, `--port`, `--install`, `--build`, `--websocket`, `--timeout`, `--no-build`, `--no-start` |
+| `srv service info\|status <domain> <name>` | Details / state |
+| `srv service start\|stop\|restart <domain> <name>` | Control it |
+| `srv service logs <domain> <name>` | Follow its output |
+| `srv service build <domain> <name>` | Install dependencies, build, (re)start |
+| `srv service set <domain> <name> <KEY> <value>` | `DIR START_CMD INSTALL_CMD BUILD_CMD NODE PY_VERSION PORT ROUTE STRIP WEBSOCKET TIMEOUT MAX_BODY` |
+| `srv service exec <domain> <name> '<cmd>'` | Run a command in its folder as the site user |
+| `srv service ssl <domain> <name>` | Certificate for a service on its own domain |
+| `srv service manager <domain> <name> [systemd\|pm2\|supervisor]` | Switch process manager |
+| `srv service remove <domain> <name>` | Remove it (the code stays) |
+
 ## Deploys
 
 | Command | What it does |
@@ -232,6 +248,7 @@ column.
 | `/etc/srv/releases/<domain>/` | Release metadata (commit, date, status) |
 | `/etc/srv/cron/<domain>.jobs` | Cron jobs (rendered to `/etc/cron.d/srv-<user>-jobs`) |
 | `/etc/srv/rclone.conf` | Remote storage credentials |
+| `/etc/srv/services/<domain>/<name>.conf` | Service settings |
 | `/var/www/<domain>/` | Site home: `app/` or `repo.git/` + `releases/` + `shared/` + `current`, `logs/`, `tmp/`, `app.env`, `venv/` |
 | `/var/www/_srv/maintenance.html` | Maintenance page |
 | `/var/www/_srv/ip/` | The server IP's static page (`srv ip page`) |
@@ -240,7 +257,7 @@ column.
 | `/etc/nginx/srv-custom/<domain>/*.conf` | Your Nginx additions |
 | `/etc/nginx/snippets/srv-*.conf`, `/etc/nginx/conf.d/01-srv-maps.conf` | Shared Nginx snippets |
 | `/var/log/nginx/<domain>.access.log`, `.error.log` | Nginx logs |
-| `/opt/srv/run/<domain>.sh` | App launchers |
+| `/opt/srv/run/<domain>.sh`, `<domain>--<name>.sh` | App and service launchers |
 | `/opt/srv/node/<major>/` | Node.js versions |
 | `/opt/srv/python/` | Extra Python versions (uv) |
 | `/opt/srv/tools/`, `/opt/srv/tools-web/` | Adminer, phpMyAdmin, the pgweb binary, the tools' start page |
@@ -257,6 +274,7 @@ column.
 | App under PM2 | PM2 daemon of `<user>`, started by `pm2-<user>.service` |
 | App under Supervisor | program `srv-<user>` |
 | Laravel workers | Supervisor group `srv-<user>-laravel` |
+| Service | `srv-<user>-svc-<name>.service` (systemd), `<domain>--<name>` (PM2), `srv-<user>-svc-<name>` (Supervisor); log `/var/www/<domain>/logs/svc-<name>.log`; domain-mode vhost `/etc/nginx/sites-available/srv-svc-<domain>--<name>.conf` |
 | PHP-FPM pool | `/etc/php/<v>/fpm/pool.d/srv-<user>.conf` in `php<v>-fpm` |
 | Webhook receiver | `srv-webhook.service`, queue runner `srv-deploy-queue.path` |
 | pgweb | `srv-pgweb.service` (as `srv-tools`, on `127.0.0.1:8081` or the next free port) |

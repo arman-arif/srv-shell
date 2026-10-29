@@ -100,11 +100,14 @@ sudo srv deploy log shop.example.com -f                # follow a running deploy
    - **Python:** a new virtualenv in the release (`.venv`), dependencies from
      `requirements.txt` or `pyproject.toml`, `collectstatic` for Django.
    - Then your own `DEPLOY_BUILD` command, if set.
+   - Then each of the site's [services](03-apps.md#services-extra-processes-inside-a-site):
+     dependencies installed in its folder inside the new release.
 4. **Migrate** (Laravel: `artisan migrate --force`; Django: `manage.py migrate`),
    if `DEPLOY_MIGRATE=yes`. With `--maintenance`, the maintenance page is shown
    from here until the health check.
 5. **Switch** `current` to the new release in one atomic step, then reload
-   PHP-FPM, or restart the app, and restart the Laravel workers.
+   PHP-FPM, or restart the app, and restart the Laravel workers and the site's
+   services.
 6. Run your `DEPLOY_AFTER` command, if set (a failure only warns).
 7. **Health check:** request `DEPLOY_HEALTH_PATH` (default `/`) through Nginx,
    retrying for about 15 seconds. Any status below 500 counts as healthy. If the
