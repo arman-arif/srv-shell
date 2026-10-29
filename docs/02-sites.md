@@ -135,8 +135,10 @@ sudo srv site add cms.example.com --type python --framework django --pg --ssl
 sudo srv site add grafana.example.com --type proxy --upstream 127.0.0.1:3000 --websocket --ssl
 ```
 
-Proxy sites have no code, database or deploys. To send the original `Host`
-header to the upstream, run `srv site set <domain> PRESERVE_HOST yes`.
+Proxy sites have no code, database or deploys. For upstreams on this machine or
+an IP address, the visitor's `Host` header is passed through; for a host-name
+upstream (usually another website) you're asked, and the default is to send the
+upstream's own name. Change it with `srv site set <domain> PRESERVE_HOST yes|no`.
 
 ## Putting code on a site without git
 

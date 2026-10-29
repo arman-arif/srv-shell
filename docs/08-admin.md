@@ -22,6 +22,50 @@ sudo srv dashboard --once          # print once and exit
 every site's HTTP status and response time, apps and workers, certificates and
 the results of the health checks.
 
+## The server IP
+
+What visitors see when they open `http://<server-ip>` (or any domain pointed at
+the server that isn't a site):
+
+```bash
+sudo srv ip                          # current setting
+sudo srv ip block                    # close the connection (the default)
+sudo srv ip page                     # a static page from /var/www/_srv/ip
+sudo srv ip page ./landing.html      # …using this file as index.html
+sudo srv ip page ./landing/          # …or this whole folder (needs an index.html)
+sudo srv ip redirect example.com     # 301 to https://example.com (keeps the path)
+sudo srv ip site example.com         # show example.com's content on the IP
+```
+
+| Mode | `http://<ip>` | Good for |
+|---|---|---|
+| `block` | Connection closed (Nginx code 444) | Production servers: scanners and bots get nothing |
+| `page` | Your static HTML page | A neutral "nothing here" or contact page |
+| `redirect` | 301 to the site's domain | Sending stray visitors to your main site |
+| `site` | The site itself, over HTTP | Testing before DNS is ready, or a server with one app |
+
+**HTTPS on the IP is always refused**, in every mode. No certificate can be valid
+for a bare IP, so without this Nginx would answer with one of your sites and its
+certificate (and a browser warning). On Nginx 1.19.4 and newer the handshake is
+rejected outright; older Nginx gets a throwaway self-signed certificate and then
+closes the connection.
+
+Details:
+
+- **page:** edit the files in `/var/www/_srv/ip/` at any time, no reload
+  needed. `index.html` is the start page; CSS, images and other files next to
+  it are served too. `srv ip page <file|folder>` replaces the folder's contents.
+- **site:** works for every site type. Apps receive the site's own domain as the
+  `Host` header, so host checks (such as Django's `ALLOWED_HOSTS`) still pass.
+  The site's maintenance mode applies on the IP too. Changing the site's settings
+  updates the IP's config automatically.
+- If the site used by `redirect` or `site` is disabled, the IP falls back to
+  `block` until it's enabled again; if the site is removed, the setting goes back
+  to `block`.
+- The database tools keep working on the IP in every mode, when they're served
+  there (`srv tools host _`). Move them to a domain with `srv tools host <domain>`
+  so nothing but your chosen mode answers on the IP.
+
 ## Health checks
 
 ```bash

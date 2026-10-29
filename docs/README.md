@@ -19,7 +19,7 @@ commands below do.
 | 5 | [SSL and databases](05-ssl-databases.md) | Let's Encrypt certificates, MySQL/MariaDB and PostgreSQL databases and users |
 | 6 | [Backups and restore](06-backups.md) | Daily backups, restoring sites and databases, remote copies, moving to a new server |
 | 7 | [Runtimes](07-runtimes.md) | Several PHP, Node.js and Python versions side by side, PHP extensions |
-| 8 | [Administration](08-admin.md) | Adminer/phpMyAdmin, health checks, alerts, the dashboard, cron jobs, status, updating srv |
+| 8 | [Administration](08-admin.md) | Status, dashboard, what the server IP shows, health checks, alerts, Adminer/phpMyAdmin, cron jobs, updating srv |
 
 ## Look-ups
 

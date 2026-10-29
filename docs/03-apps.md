@@ -130,7 +130,7 @@ PM2 and Supervisor are installed on first use if they're missing.
 | `PY_APP`, `PY_SERVER`, `WORKERS` | Python module (`main:app`), `gunicorn`/`uvicorn`, worker count |
 | `PY_VERSION` | Python version for the virtualenv (`system` for the OS Python) |
 | `PORT` | The local port (must be free and not used by another site) |
-| `TIMEOUT` | Proxy read timeout in seconds (default 60); raise it for long requests |
+| `TIMEOUT` | Proxy read timeout in seconds (default 60; at least 3600 when `WEBSOCKET=yes`); raise it for long requests |
 | `WEBSOCKET` | `yes` passes WebSocket upgrades through Nginx |
 | `MAX_BODY` | Request size limit, e.g. `100m` |
 

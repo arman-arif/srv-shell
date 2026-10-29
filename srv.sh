@@ -39,7 +39,7 @@
 set -Eeuo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-SRV_VERSION="4.0.1"
+SRV_VERSION="4.1.0"
 SRV_DIR="/etc/srv"
 SRV_STATE="$SRV_DIR/installed.conf"     # installed features
 SRV_CFG="$SRV_DIR/srv.conf"             # global settings
@@ -879,26 +879,119 @@ EOF
 EOF
 }
 
-# Catch-all for unknown hostnames / the bare IP: the connection is closed —
-# except the database tools' secret path when they're served on the IP.
+# Catch-all for unknown hostnames and the bare IP (srv ip …). Port 80 does what
+# IP_MODE says: block (close the connection), page (a static page from
+# /var/www/_srv/ip), redirect (301 to a site) or site (serve a site's content).
+# The database tools' secret path works in every mode when they're on the IP.
+# Port 443 always refuses the TLS handshake: there's no valid certificate for
+# an IP, so nothing (not even another site's certificate) is shown.
+IP_ROOT="$SRV_WWW/ip"
+NGINX_DUMMY_CRT="/etc/nginx/srv-default.crt"
+NGINX_DUMMY_KEY="/etc/nginx/srv-default.key"
+
+ip_mode() {   # → the effective mode; a missing or disabled site falls back to block
+  local m t; m=$(cfg_get IP_MODE block); t=$(cfg_get IP_TARGET)
+  case $m in
+    page) echo page ;;
+    redirect|site)
+      if [[ -n $t ]] && site_exists "$t" && [[ $(site_get "$t" ENABLED yes) == yes ]]; then echo "$m"; else echo block; fi ;;
+    *) echo block ;;
+  esac
+}
+
+ip_page_init() {
+  install -d -m 755 "$IP_ROOT"
+  if [[ ! -e $IP_ROOT/index.html ]]; then
+    cat >"$IP_ROOT/index.html" <<'HTML'
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex"><title>Welcome</title>
+<style>body{font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#f6f7f9;color:#222}
+main{max-width:32rem;padding:2rem;text-align:center}h1{font-size:1.6rem}p{color:#555;line-height:1.5}</style></head>
+<body><main><h1>It works</h1><p>This server is up. There's no website at this address.</p></main></body></html>
+HTML
+    chmod 644 "$IP_ROOT/index.html"
+  fi
+}
+
+nginx_default_tls() {   # the port-443 catch-all's TLS lines
+  local nv; nv=$(nginx_version)
+  if [[ -n $nv ]] && ver_ge "$nv" 1.19.4; then
+    echo "    ssl_reject_handshake on;"
+  else
+    # Older Nginx can't refuse the handshake: present a throwaway self-signed
+    # certificate and close the connection.
+    if [[ ! -s $NGINX_DUMMY_CRT || ! -s $NGINX_DUMMY_KEY ]]; then
+      openssl req -x509 -nodes -newkey rsa:2048 -days 3650 -subj "/CN=invalid" \
+        -keyout "$NGINX_DUMMY_KEY" -out "$NGINX_DUMMY_CRT" >>"$SRV_LOG" 2>&1 || true
+      chmod 600 "$NGINX_DUMMY_KEY" 2>/dev/null || true
+    fi
+    echo "    ssl_certificate     $NGINX_DUMMY_CRT;"
+    echo "    ssl_certificate_key $NGINX_DUMMY_KEY;"
+    echo "    return 444;"
+  fi
+}
+
 nginx_write_default() {
+  local mode t v6=0 tools=0 nv h2_listen=""
+  mode=$(ip_mode); t=$(cfg_get IP_TARGET)
+  if [[ -f /proc/net/if_inet6 ]]; then v6=1; fi
+  if [[ $(cfg_get TOOLS_HOST _) == _ && -f $TOOLS_CONF ]]; then tools=1; fi
+  # Old Nginx sets http2 per listen socket; match the sites so the options agree
+  nv=$(nginx_version)
+  if [[ -n $nv ]] && ! ver_ge "$nv" 1.25.1; then h2_listen=" http2"; fi
+  if [[ $mode == page ]]; then ip_page_init; fi
   {
-    echo "# Managed by srv — catch-all for unknown hosts"
+    echo "# Managed by srv — catch-all for unknown hosts and the server IP (srv ip: $mode${t:+ $t})"
     echo "server {"
     echo "    listen 80 default_server;"
-    if [[ -f /proc/net/if_inet6 ]]; then echo "    listen [::]:80 default_server;"; fi
+    if (( v6 )); then echo "    listen [::]:80 default_server;"; fi
+    echo "    server_name _;"
+    if [[ $mode != site ]]; then echo "    access_log off;"; fi
+    if (( tools )); then
+      echo
+      echo "    # Database tools — srv tools"
+      echo "    include $TOOLS_CONF;"
+    fi
+    case $mode in
+      block)
+        echo "    location / { return 444; }" ;;
+      page)
+        echo
+        echo "    # Static page — srv ip page (files in $IP_ROOT)"
+        echo "    include snippets/srv-security.conf;"
+        echo "    root $IP_ROOT;"
+        echo "    index index.html;"
+        echo "    location / { try_files \$uri \$uri/ =404; }" ;;
+      redirect)
+        local target="http://$t"; if [[ $(site_get "$t" SSL no) == yes ]]; then target="https://$t"; fi
+        echo
+        echo "    # Redirect to $t — srv ip redirect"
+        echo "    location / { return 301 $target\$request_uri; }" ;;
+      site)
+        echo
+        echo "    # Serves $t — srv ip site"
+        site_nginx_extras "$t"
+        # Apps get the site's own name as Host, so host checks (Django's
+        # ALLOWED_HOSTS, virtual hosts upstream) accept requests made to the IP
+        # shellcheck disable=SC2016
+        site_nginx_body "$t" | sed "s|proxy_set_header Host \$host;|proxy_set_header Host $t;|" ;;
+    esac
+    echo "}"
+    echo
+    echo "server {"
+    echo "    listen 443 ssl${h2_listen} default_server;"
+    if (( v6 )); then echo "    listen [::]:443 ssl${h2_listen} default_server;"; fi
     echo "    server_name _;"
     echo "    access_log off;"
-    if [[ $(cfg_get TOOLS_HOST _) == _ && -f $TOOLS_CONF ]]; then
-      echo "    include $TOOLS_CONF;"
-      echo "    location / { return 444; }"
-    else
-      echo "    return 444;"
-    fi
+    nginx_default_tls
     echo "}"
   } >/etc/nginx/sites-available/000-srv-default.conf
   ln -sfn /etc/nginx/sites-available/000-srv-default.conf /etc/nginx/sites-enabled/000-srv-default.conf
 }
+
+# Re-render the catch-all when a site it serves or redirects to changed
+ip_refresh_for() { if [[ $(cfg_get IP_TARGET) == "$1" && $(cfg_get IP_MODE block) != block && $(cfg_get IP_MODE) != page ]]; then nginx_write_default; fi; }
 
 mod_nginx() {
   step "Installing Nginx"
@@ -2291,10 +2384,12 @@ site_apply_nginx() {
   install -d -m 755 "$NGINX_CUSTOM/$d"
   site_render_nginx "$d" >"$avail"
   if [[ $(site_get "$d" ENABLED yes) == yes ]]; then ln -sfn "$avail" "$enabled"; else rm -f "$enabled"; fi
+  ip_refresh_for "$d"
   if ! out=$(nginx -t 2>&1); then
     err "Nginx rejected the config for $d:"
     printf '%s\n' "$out" | tail -n 5 | sed 's/^/     │ /' >&2
     if [[ -n $bak ]]; then cp -a "$bak" "$avail"; else rm -f "$avail" "$enabled"; fi
+    ip_refresh_for "$d"
     return 1
   fi
   run systemctl reload nginx
@@ -2947,15 +3042,21 @@ site_disable() {
   local d; d=$(resolve_domain "${1:-}") || exit 1
   site_set "$d" ENABLED no
   rm -f "/etc/nginx/sites-enabled/$d.conf"
+  ip_refresh_for "$d"
   nginx_reload || die "Nginx reload failed"
   ok "$d disabled (files, database, app process and config are kept)"
 }
 
 site_rebuild() {
-  local -a list=(); local d failed=0
+  local -a list=(); local d failed=0 all=0
   if [[ ${1:-} == --all ]]; then
+    all=1
     mapfile -t list < <(site_list_domains)
-    (( ${#list[@]} )) || { info "No sites."; return 0; }
+    if (( ! ${#list[@]} )); then
+      info "No sites."
+      if feat_has nginx; then nginx_write_default && nginx_reload; fi
+      return
+    fi
   else
     d=$(resolve_domain "${1:-}") || exit 1
     list=("$d")
@@ -2971,6 +3072,11 @@ site_rebuild() {
       err "$d failed"; failed=1
     fi
   done
+  if (( all )); then
+    info "Rebuilding the catch-all server (srv ip)"
+    nginx_write_default
+    nginx_reload || failed=1
+  fi
   if (( failed )); then return 1; fi
 }
 
@@ -3256,8 +3362,15 @@ site_remove() {
   rm -f "${SRV_RUN:?}/${d:?}.sh" "${SRV_RUN:?}/${d:?}.pm2.config.js" "${HOOKS_DIR:?}/${d:?}.json" "${DEPLOY_QUEUE:?}/${d:?}"
   rm -rf "${SRV_DIR:?}/releases/${d:?}"
 
+  if [[ $(cfg_get IP_TARGET) == "$d" ]]; then
+    if [[ $(cfg_get IP_MODE block) == redirect || $(cfg_get IP_MODE) == site ]]; then
+      cfg_set IP_MODE block; warn "The server IP showed $d — it now closes connections again (change with: srv ip)"
+    fi
+    cfg_set IP_TARGET ""
+  fi
   rm -f "/etc/nginx/sites-enabled/$d.conf" "/etc/nginx/sites-available/$d.conf"
   rm -rf "${NGINX_CUSTOM:?}/$d"
+  nginx_write_default
   nginx_reload || warn "Nginx reload failed — check: nginx -t"
   local f v
   for f in /etc/php/*/fpm/pool.d/srv-"$user".conf; do
@@ -5267,6 +5380,119 @@ cmd_tools() {
 }
 
 # =============================================================================
+#  SERVER IP — what visitors see at http://<server-ip> (and any unknown name)
+# =============================================================================
+ip_describe() {
+  local m t; m=$(ip_mode); t=$(cfg_get IP_TARGET)
+  case $m in
+    block)    echo "blocked — connections are closed" ;;
+    page)     echo "static page from $IP_ROOT" ;;
+    redirect) echo "redirects to $( [[ $(site_get "$t" SSL no) == yes ]] && echo https || echo http )://$t" ;;
+    site)     echo "shows the site $t" ;;
+  esac
+  if [[ $(cfg_get IP_MODE block) != "$m" ]]; then echo "  (set to $(cfg_get IP_MODE) $t, but that site is missing or disabled)"; fi
+}
+
+ip_show() {
+  local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  printf '  %-10s %s\n' "HTTP" "$(ip_describe | head -n 1)" "HTTPS" "refused (no certificate is valid for an IP address)"
+  ip_describe | sed -n '2p'
+  if [[ $(cfg_get TOOLS_HOST _) == _ && -f $TOOLS_CONF ]]; then printf '  %-10s %s\n' "Tools" "$(tools_url) (srv tools host <domain> moves them)"; fi
+  echo
+  echo "  Test: curl -I http://${ip:-<server-ip>}/"
+}
+
+ip_apply() {   # mode [target] — save, render, test; restore the old setting if Nginx refuses
+  local old_m old_t out; old_m=$(cfg_get IP_MODE block); old_t=$(cfg_get IP_TARGET)
+  ensure_feature nginx
+  cfg_set IP_MODE "$1"; cfg_set IP_TARGET "${2:-}"
+  nginx_write_default
+  if ! out=$(nginx -t 2>&1); then
+    err "Nginx rejected the catch-all config:"
+    printf '%s\n' "$out" | tail -n 5 | sed 's/^/     │ /' >&2
+    cfg_set IP_MODE "$old_m"; cfg_set IP_TARGET "$old_t"; nginx_write_default
+    return 1
+  fi
+  run systemctl reload nginx
+  ok "Server IP: $(ip_describe | head -n 1)"
+}
+
+ip_page_set() {   # [file.html | folder] — copy into the page folder
+  local src=${1:-} tmp
+  if [[ -z $src ]]; then
+    ip_page_init
+    info "Edit or replace the files in $IP_ROOT (index.html is the start page) — no reload needed"
+    return 0
+  fi
+  [[ -e $src ]] || die "Not found: $src"
+  tmp=$(mktemp -d "$TMP_DIR/ip.XXXXXX")
+  if [[ -d $src ]]; then
+    [[ -f $src/index.html ]] || warn "$src has no index.html — visitors to / will get 404"
+    cp -a "$src/." "$tmp/" || die "Copying $src failed"
+  else
+    [[ $src == *.htm || $src == *.html ]] || warn "$src doesn't end in .html — using it as index.html anyway"
+    cp "$src" "$tmp/index.html" || die "Copying $src failed"
+  fi
+  rm -rf "${IP_ROOT:?}"
+  mv "$tmp" "$IP_ROOT"
+  chown -R root:root "$IP_ROOT"
+  find "$IP_ROOT" -type d -exec chmod 755 {} +
+  find "$IP_ROOT" -type f -exec chmod 644 {} +
+  ok "Page files copied to $IP_ROOT"
+}
+
+ip_pick_site() {   # [domain] → a site name
+  local d=${1:-}
+  if [[ -z $d ]]; then
+    (( INTERACTIVE )) || die "Name the site, e.g.: srv ip site example.com"
+    d=$(pick_site any) || die "Cancelled."
+  fi
+  d=$(resolve_domain "$d") || exit 1
+  [[ $(site_get "$d" ENABLED yes) == yes ]] || die "$d is disabled — enable it first: srv site enable $d"
+  printf '%s' "$d"
+}
+
+cmd_ip() {
+  local sub=${1:-status}; shift || true
+  case $sub in
+    status|show) echo; ip_show ;;
+    block|off|444)  ip_apply block ;;
+    page|html|static)
+      ip_page_set "${1:-}"
+      ip_apply page
+      info "Change the page any time: edit $IP_ROOT, or run: srv ip page <file.html|folder>" ;;
+    redirect)
+      local d; d=$(ip_pick_site "${1:-}")
+      ip_apply redirect "$d" ;;
+    site|serve)
+      local d; d=$(ip_pick_site "${1:-}")
+      ip_apply site "$d"
+      info "HTTP on the IP shows $d. HTTPS on the IP stays refused — use https://$d for that." ;;
+    *) die "Usage: srv ip [status|block|page [file.html|folder]|redirect <domain>|site <domain>]" ;;
+  esac
+}
+
+menu_ip() {
+  local c d
+  c=$(ui_menu "Server IP" "Visitors at http://<server-ip> now see: $(ip_describe | head -n 1)" \
+    block    "Block — close the connection (default, safest)" \
+    page     "A static HTML page (edit it in $IP_ROOT)" \
+    redirect "Redirect to one of your sites" \
+    site     "Show one of your sites" \
+    status   "Show the current setting") || return 0
+  case $c in
+    status)   echo; ip_show ;;
+    block)    ip_apply block ;;
+    page)
+      local src
+      src=$(ui_input "HTML file or folder to publish (blank = keep/create $IP_ROOT/index.html)" "" empty) || return 0
+      ip_page_set "$src"; ip_apply page ;;
+    redirect|site)
+      if d=$(pick_site any); then ip_apply "$c" "$d"; fi ;;
+  esac
+}
+
+# =============================================================================
 #  CHECKS, ALERTS, DASHBOARD
 # =============================================================================
 CHECK_RESULTS=()
@@ -6413,6 +6639,7 @@ cmd_status() {
   done
   if [[ -n $(cfg_get BACKUP_REMOTE) ]]; then printf '  %-13s %s\n' "  remote" "$(cfg_get BACKUP_REMOTE) (kept $(cfg_get BACKUP_REMOTE_KEEP 30) days)"; fi
   if feat_has dbadmin; then printf '  %-13s %s\n' "  tools URL" "$(tools_url)"; fi
+  if feat_has nginx; then printf '  %-13s %s\n' "  server IP" "$(ip_describe | head -n 1)  (srv ip)"; fi
   printf '  %-13s %s\n' "alerts" "$(x=$(cfg_get NOTIFY_TYPE); echo "${x:-off} (srv notify setup · health check: srv check)")"
 
   echo; printf '%sServices%s\n' "$C_BOLD" "$C_0"
@@ -6460,6 +6687,7 @@ main_menu() {
       check   "Health check & alerts" \
       runtimes "PHP / Node.js / Python versions" \
       tools   "Database tools (Adminer / phpMyAdmin)" \
+      ip      "Server IP — block it, show a page or a site" \
       ssl     "SSL certificates" \
       db      "Databases (MySQL/MariaDB, PostgreSQL)" \
       backup  "Backups" \
@@ -6477,6 +6705,7 @@ main_menu() {
       check)   try menu_check; continue ;;
       runtimes) try menu_runtimes; continue ;;
       tools)   try menu_tools; continue ;;
+      ip)      try menu_ip ;;
       ssl)     try menu_ssl; continue ;;
       db)      try menu_db; continue ;;
       backup)  try menu_backup; continue ;;
@@ -6792,6 +7021,8 @@ Admin
   check [--notify] [--quiet]   Health checks (exit code 0 ok, 1 warnings, 2 failures)
   notify setup|test|off|deploys on|off   Alerts via Telegram, Slack, Discord or a webhook
   tools [status|install [adminer|phpmyadmin]|password|allow "ips"|host <domain>|db-user|update|remove]
+  ip [status|block|page [file.html|folder]|redirect <domain>|site <domain>]
+                               What http://<server-ip> shows (default: block; HTTPS on the IP is always refused)
   cron <domain> list | add "<schedule>" "<command>" | remove <n> | run <n>
   self-update [URL|file]       Update srv to the latest version from GitHub (or a given URL/file;
                                syntax-checked first, previous version kept as a backup)
@@ -6899,6 +7130,7 @@ main() {
     node)    case ${1:-list} in list|ls) ;; *) acquire_lock ;; esac; cmd_node "$@" ;;
     python)  case ${1:-list} in list|ls) ;; *) acquire_lock ;; esac; cmd_python "$@" ;;
     tools)   case ${1:-status} in status|show|info) ;; *) acquire_lock ;; esac; cmd_tools "$@" ;;
+    ip)      case ${1:-status} in status|show) ;; *) acquire_lock ;; esac; cmd_ip "$@" ;;
     cron)    case ${2:-list} in list|ls) ;; *) acquire_lock ;; esac; cmd_cron "$@" ;;
     self-install) self_install ;;
     self-update)  acquire_lock; self_update "$@" ;;

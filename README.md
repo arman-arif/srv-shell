@@ -23,7 +23,8 @@ script it from the command line, CI or cron.
 - **Backups**: databases and site files with rotation, one-command restore
   (also onto a new server), and remote copies to S3, R2, B2 or Google Drive.
 - **Admin**: Adminer/phpMyAdmin behind a secret URL, a password and an
-  optional IP allowlist; health checks with Telegram, Slack, Discord or
+  optional IP allowlist; control over what the bare server IP shows (blocked by
+  default, or a static page, a redirect or a site); health checks with Telegram, Slack, Discord or
   webhook alerts; a live dashboard; per-site cron jobs; and self-update.
 
 ## Documentation
@@ -166,7 +167,7 @@ message.
 | Databases | `db create\|list\|drop\|password` (`--mysql` / `--pg`) |
 | Backups | `backup run\|db\|site\|list\|restore\|restore-db\|remote …` |
 | Runtimes | `php list\|install\|default\|remove\|ext`, `node list\|install\|default\|upgrade\|remove`, `python list\|install\|remove` |
-| Admin | `tools …` (Adminer/phpMyAdmin), `notify …`, `cron <domain> …`, `ssl add\|list\|renew-test` |
+| Admin | `tools …` (Adminer/phpMyAdmin), `ip block\|page\|redirect\|site`, `notify …`, `cron <domain> …`, `ssl add\|list\|renew-test` |
 
 Run `srv help` for the full reference with all options, or see the
 [command reference](docs/10-reference.md). `-y`/`--yes` accepts

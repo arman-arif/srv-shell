@@ -138,6 +138,11 @@ Add `--mysql` or `--pg` when both servers are installed.
 | `srv tools host <domain>\|_` | Where the tools are served |
 | `srv tools db-user [--mysql\|--pg]` | Create/reset the `srv_admin` database login |
 | `srv tools update\|remove` | Update / remove |
+| `srv ip [status]` | What the server IP shows |
+| `srv ip block` | Close connections to the IP (default) |
+| `srv ip page [file.html\|folder]` | Show a static page from `/var/www/_srv/ip` |
+| `srv ip redirect <domain>` | 301 the IP to a site |
+| `srv ip site <domain>` | Show a site's content on the IP (HTTP) |
 | `srv notify [setup\|test\|off\|deploys on\|off]` | Alerts |
 | `srv cron <domain> list\|add "<schedule>" "<cmd>"\|remove <n>\|run <n>` | Per-site cron jobs |
 
@@ -173,10 +178,10 @@ sense).
 | `PM` | node, python | via `app manager` | Process manager |
 | `APP_ACTIVE` | node, python | — | Whether the app should be running |
 | `WEBSOCKET` | node, python, proxy | yes | `yes` = pass WebSocket upgrades |
-| `TIMEOUT` | node, python, proxy | yes | Proxy timeout in seconds (default 60) |
+| `TIMEOUT` | node, python, proxy | yes | Proxy timeout in seconds (default 60; at least 3600 with WebSockets) |
 | `MAX_BODY` | node, python, proxy | yes | Request size limit, e.g. `100m` |
 | `UPSTREAM` | proxy | yes | Target `host:port` or URL |
-| `PRESERVE_HOST` | proxy | yes | `yes` = send the original Host header |
+| `PRESERVE_HOST` | proxy | yes | `yes` = send the visitor's Host header (default for local/IP upstreams) |
 | `DB_ENGINE`, `DB_NAME`, `DB_USER`, `DB_PASS` | php, laravel, node, python | — | The site's database |
 | `REDIS`, `REDIS_DB` | php, laravel, node, python | via `site redis` | Redis on/off and database number |
 | `QUEUE_WORKERS`, `HORIZON`, `REVERB`, `REVERB_PORT` | laravel | via `site workers` | Workers |
@@ -213,6 +218,7 @@ column.
 | `TOOLS_HOST`, `TOOLS_PATH`, `TOOLS_ALLOW`, `TOOLS_USER`, `TOOLS_PHP` | Database tools | `srv tools host <current host>` |
 | `WEBHOOK_PORT` | Webhook receiver port (9000) | — |
 | `UPDATE_URL` | Source for `srv self-update` | — |
+| `IP_MODE`, `IP_TARGET` | What the server IP shows: `block`, `page`, `redirect`, `site` | `srv ip …` |
 
 ## Where things live
 
@@ -227,6 +233,8 @@ column.
 | `/etc/srv/rclone.conf` | Remote storage credentials |
 | `/var/www/<domain>/` | Site home: `app/` or `repo.git/` + `releases/` + `shared/` + `current`, `logs/`, `tmp/`, `app.env`, `venv/` |
 | `/var/www/_srv/maintenance.html` | Maintenance page |
+| `/var/www/_srv/ip/` | The server IP's static page (`srv ip page`) |
+| `/etc/nginx/sites-available/000-srv-default.conf` | Catch-all server for the IP and unknown names (generated) |
 | `/etc/nginx/sites-available/<domain>.conf` | Generated Nginx config (don't edit) |
 | `/etc/nginx/srv-custom/<domain>/*.conf` | Your Nginx additions |
 | `/etc/nginx/snippets/srv-*.conf`, `/etc/nginx/conf.d/01-srv-maps.conf` | Shared Nginx snippets |

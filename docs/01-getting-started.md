@@ -68,7 +68,7 @@ so you can pick new ones.
 | `firewall` | UFW, allowing only SSH, HTTP and HTTPS |
 | `fail2ban` | Bans IPs after repeated failed logins |
 | `auto-updates` | Automatic security updates (unattended-upgrades) |
-| `nginx` | Nginx with srv's security, TLS and proxy snippets, plus a catch-all default server |
+| `nginx` | Nginx with srv's security, TLS and proxy snippets, plus a catch-all server that blocks the bare IP (see `srv ip`) |
 | `php` | PHP-FPM in the version you choose, with common extensions. Run it again to add more versions |
 | `composer` | Composer |
 | `database` | MariaDB or MySQL server (`srv install mysql` / `srv install mariadb`) |

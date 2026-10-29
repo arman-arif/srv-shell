@@ -170,10 +170,9 @@ Check it with `srv app status socket.example.com`,
 `srv app logs socket.example.com`, or PM2 itself:
 `sudo -u socket_example_com pm2 status`.
 
-`--websocket` makes Nginx pass the WebSocket upgrade through. Idle connections
-are closed after `TIMEOUT` seconds (default 60); socket.io's heartbeat (every 25
-seconds) keeps them open. For plain WebSockets without pings, raise it:
-`srv site set socket.example.com TIMEOUT 3600`.
+`--websocket` makes Nginx pass the WebSocket upgrade through, and keeps idle
+connections open for at least an hour (the timeout is raised to 3600 seconds
+for WebSocket sites).
 
 **Alternative, the process stays in the main site:** run it with PM2 as the main
 site's user and put a proxy site in front:
@@ -275,8 +274,9 @@ Publish container ports on `127.0.0.1` only. (Docker's own port publishing
 bypasses UFW, so `-p 3000:3000` would make it reachable from the internet.)
 
 For an upstream on another machine: `--upstream https://10.0.0.5:8443`. Apps
-that check the host name (or generate absolute URLs) may need the original
-`Host` header: `srv site set grafana.example.com PRESERVE_HOST yes`.
+that check the host name (or generate absolute URLs) need the visitor's `Host`
+header, which IP upstreams get by default; for a host-name upstream, use
+`srv site set grafana.example.com PRESERVE_HOST yes`.
 
 ## Staging and production on one server
 

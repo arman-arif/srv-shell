@@ -10,11 +10,14 @@ sudo tail -n 50 /var/log/srv.log       # what srv did, with full command output
 
 ## "The connection was reset" when opening the server's IP
 
-That's intentional. Requests for a name that isn't a site (including the bare
-IP) are dropped by Nginx's catch-all server with code 444, so scanners learn
+That's intentional, and the default. Requests for a name that isn't a site
+(including the bare IP) are dropped by Nginx's catch-all server with code 444, and
+HTTPS connections to the IP are refused during the handshake, so scanners learn
 nothing. It also proves Nginx and the firewall are working. Open the site by its
-domain instead. (The database tools are the exception: `srv tools host _` serves
-them on the IP under their secret path.)
+domain instead, or choose what the IP shows with `srv ip` (a page, a redirect or
+a site, see [Administration](08-admin.md#the-server-ip)). The database tools are
+the exception: `srv tools host _` serves them on the IP under their secret path,
+in every mode.
 
 ## The domain doesn't load
 
@@ -68,7 +71,6 @@ plus `upload_max_filesize`/`post_max_size` for PHP.
 - `srv site set <domain> WEBSOCKET yes` (apps, proxies).
 - socket.io: allow your front-end's origin in the server's `cors` option, and
   connect with `https://` (Nginx terminates TLS).
-- Connections drop after a minute: raise `TIMEOUT`, or send pings.
 - Laravel Reverb: `srv site workers <domain> --reverb`, then
   `srv site apply-env <domain>` and rebuild the assets.
 
