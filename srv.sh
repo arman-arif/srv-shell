@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  srv — single-file server & site manager for Nginx-based web hosting
-#  Version 1.0.0 (Phase 1 / MVP)
+#  Version 2.0.0 (Phase 2)
 #
 #  What it does
 #    • Setup wizard: system upgrade, timezone, hostname, swap, sudo user,
 #      SSH hardening, UFW firewall, fail2ban, automatic security updates
-#    • Stack: Nginx, PHP-FPM (any version, Ondřej Surý repo) + Composer,
-#      MariaDB / MySQL, Certbot (Let's Encrypt), scheduled database backups
-#    • Sites: static, SPA, generic PHP, Laravel — each site gets its own Linux
-#      user and PHP-FPM pool, an optional database and HTTPS
+#    • Stack: Nginx, PHP-FPM (any version) + Composer, MariaDB / MySQL,
+#      PostgreSQL, Redis, Node.js (any version), Python 3, Supervisor, PM2,
+#      Certbot (Let's Encrypt), scheduled database backups
+#    • Sites: static, SPA, PHP, Laravel, Node.js apps (Next.js, Nuxt, NestJS,
+#      Express …), Python apps (Django, Flask, FastAPI) and reverse proxies.
+#      Each site gets its own Linux user, optional database (MySQL or
+#      PostgreSQL), optional Redis and HTTPS.
+#    • Apps run under systemd, PM2 or Supervisor — one set of commands for all
+#    • Laravel queue workers, Horizon and Reverb via Supervisor
 #    • Anything skipped during setup can be installed later:  srv install
 #
 #  Supported OS: Ubuntu 22.04+ LTS, Debian 12+
@@ -18,18 +23,24 @@
 #    sudo bash srv.sh setup     # first run — also installs the 'srv' command
 #    sudo srv                   # interactive menu
 #    sudo srv help              # all commands
+#
+#  Upgrading an existing server:  sudo bash srv.sh self-install
 # =============================================================================
 
 set -Eeuo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-SRV_VERSION="1.0.0"
+SRV_VERSION="2.0.0"
 SRV_DIR="/etc/srv"
 SRV_STATE="$SRV_DIR/installed.conf"     # installed features
 SRV_CFG="$SRV_DIR/srv.conf"             # global settings
 SRV_SITES="$SRV_DIR/sites"              # one <domain>.conf per site
 SRV_LOG="/var/log/srv.log"
 SRV_BIN="/usr/local/bin/srv"
+SRV_LIB="/opt/srv"                      # runtimes and app launchers
+SRV_RUN="$SRV_LIB/run"                  # <domain>.sh launchers, PM2 configs
+NODE_ROOT="$SRV_LIB/node"               # <major> -> versions/vX.Y.Z
+PM2_PREFIX="$SRV_LIB/pm2"
 WEB_ROOT="/var/www"
 ACME_ROOT="/var/www/_letsencrypt"
 NGINX_CUSTOM="/etc/nginx/srv-custom"
@@ -38,7 +49,7 @@ PHP_DEFAULT="8.4"
 PHP_OFFERED=(8.4 8.5 8.3 8.2 8.1)
 
 FEATURES=(upgrade timezone hostname swap sudo-user ssh firewall fail2ban auto-updates
-          nginx php composer database certbot backup)
+          nginx php composer database postgres redis node python supervisor pm2 certbot backup)
 
 # ── Runtime state ────────────────────────────────────────────────────────────
 INTERACTIVE=0
@@ -52,11 +63,17 @@ TMP_DIR=""
 SRV_MAIN_PID=$$
 OS_ID="" OS_VER="" OS_CODENAME="" OS_NAME=""
 MOD_OK=() MOD_FAIL=()
+NODE_LAST_MAJOR=""
+DB_ENG=""
 
 # Answers collected by the ask_* functions, consumed by the mod_* functions
 OPT_TZ="" OPT_HOSTNAME="" OPT_SWAP="" OPT_USER="" OPT_USER_KEYS="no" OPT_USER_PASS=""
 OPT_SSH_PORT="" OPT_ROOT_LOGIN="" OPT_SSH_NOPASS="no" OPT_PHP="" OPT_DB_ENGINE=""
-OPT_EMAIL="" OPT_BACKUP_KEEP=""
+OPT_EMAIL="" OPT_BACKUP_KEEP="" OPT_NODE="" OPT_PG="" OPT_REDIS_POLICY=""
+
+# Answers collected while adding a site
+S_NODE="" S_PRESET="" S_START="" S_START_SET=0 S_BUILD="" S_BUILD_SET=0 S_PM="" S_PORT=""
+S_FRAMEWORK="" S_SERVER="" S_MODULE="" S_MODULE_SET=0 S_WORKERS="" S_UPSTREAM="" S_WS="" S_PRESERVE=""
 
 # ── Output & logging ─────────────────────────────────────────────────────────
 if [[ -t 2 ]]; then
@@ -82,7 +99,8 @@ cleanup() { if [[ $BASHPID == "$SRV_MAIN_PID" && -n $TMP_DIR && -d $TMP_DIR ]]; 
 run() {
   log "RUN   $*"
   local rc=0
-  "$@" >>"$SRV_LOG" 2>&1 || rc=$?
+  # 9>&- : don't let daemons started by the command inherit srv's lock
+  "$@" 9>&- >>"$SRV_LOG" 2>&1 || rc=$?
   if (( rc == 0 )); then return 0; fi
   err "Command failed (exit $rc): $*"
   tail -n 12 "$SRV_LOG" 2>/dev/null | sed 's/^/     │ /' >&2 || true
@@ -237,6 +255,7 @@ need_val()  { [[ $# -ge 2 ]] || die "Option $1 needs a value."; }
 in_list()   { local n=$1 x; shift; for x in "$@"; do if [[ $x == "$n" ]]; then return 0; fi; done; return 1; }
 mem_mb()    { awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo; }
 ver_ge()    { [[ $(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1) == "$2" ]]; }
+yn()        { if "$@"; then echo yes; else echo no; fi; }
 
 gen_password() {
   local p
@@ -246,7 +265,9 @@ gen_password() {
 }
 
 valid_domain()   { [[ $1 =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$ ]]; }
-valid_db_ident() { [[ $1 =~ ^[A-Za-z0-9_]{1,64}$ ]]; }
+valid_db_ident() { [[ $1 =~ ^[A-Za-z0-9_]{1,63}$ ]]; }
+valid_port()     { [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= 1024 && $1 <= 65535 )); }
+valid_relpath()  { [[ $1 != *..* && $1 =~ ^[A-Za-z0-9._/-]*$ ]]; }
 
 pkg_installed() { [[ $(dpkg-query -W -f='${Status}' "$1" 2>/dev/null || true) == "install ok installed" ]]; }
 pkg_available() {
@@ -287,6 +308,19 @@ cert_days_left() {
   printf '%s' $(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
 }
 
+port_in_use()       { [[ -n $(ss -Hltn "sport = :$1" 2>/dev/null) ]]; }
+port_used_by_site() { grep -qsE "^(PORT|REVERB_PORT)=$1\$" "$SRV_SITES"/*.conf; }
+port_alloc() {
+  local p; p=$(cfg_get APP_PORT_START 3001)
+  while port_used_by_site "$p" || port_in_use "$p"; do
+    p=$(( p + 1 ))
+    if (( p > 65000 )); then return 1; fi
+  done
+  printf '%s' "$p"
+}
+
+user_rss_mb() { { ps -u "$1" -o rss= 2>/dev/null || true; } | awk '{s+=$1} END {printf "%d", s/1024}'; }
+
 # ── Core setup ───────────────────────────────────────────────────────────────
 detect_os() {
   [[ -r /etc/os-release ]] || die "Cannot detect the OS (/etc/os-release missing)."
@@ -321,8 +355,9 @@ self_install() {
   if [[ $src == "$SRV_BIN" ]]; then return 0; fi
   if [[ -f $src ]]; then
     if [[ -f $SRV_BIN ]] && cmp -s "$src" "$SRV_BIN"; then return 0; fi
+    local verb=Installed; if [[ -f $SRV_BIN ]]; then verb=Updated; fi
     install -m 0755 "$src" "$SRV_BIN"
-    ok "Installed the 'srv' command to $SRV_BIN"
+    ok "$verb the 'srv' command ($SRV_BIN, version $SRV_VERSION)"
   else
     warn "Couldn't self-install (not run from a file). Copy the script to $SRV_BIN manually."
   fi
@@ -371,6 +406,12 @@ feat_desc() {
     php)          echo "PHP-FPM (choose version)" ;;
     composer)     echo "Composer (PHP dependency manager)" ;;
     database)     echo "MariaDB or MySQL server" ;;
+    postgres)     echo "PostgreSQL server (choose version)" ;;
+    redis)        echo "Redis — cache, sessions, queues" ;;
+    node)         echo "Node.js (choose version) + npm, pnpm, yarn" ;;
+    python)       echo "Python 3 + venv for gunicorn / uvicorn apps" ;;
+    supervisor)   echo "Supervisor — Laravel queues, Horizon, Reverb, apps" ;;
+    pm2)          echo "PM2 process manager for apps (needs Node.js)" ;;
     certbot)      echo "Certbot — free Let's Encrypt SSL" ;;
     backup)       echo "Daily database backups with rotation" ;;
     *)            echo "$1" ;;
@@ -379,7 +420,7 @@ feat_desc() {
 
 feat_default() {
   case $1 in
-    hostname|sudo-user) echo OFF ;;
+    hostname|sudo-user|postgres|redis|node|python|supervisor|pm2) echo OFF ;;
     swap) if [[ -n $(swapon --show --noheadings 2>/dev/null) ]]; then echo OFF; else echo ON; fi ;;
     *) echo ON ;;
   esac
@@ -389,7 +430,7 @@ feat_default() {
 mod_base() {
   step "Installing base packages"
   apt_install ca-certificates curl wget gnupg git unzip zip rsync acl cron logrotate \
-              openssl sudo htop whiptail
+              openssl sudo htop whiptail xz-utils
   cat >/etc/logrotate.d/srv <<'EOF'
 /var/log/srv.log /var/log/srv-backup.log {
     weekly
@@ -617,7 +658,7 @@ mod_ssh() {
   fi
   ssh_restart || true
   sleep 1
-  if [[ -z $(ss -Hltn "sport = :$port" 2>/dev/null) ]]; then
+  if ! port_in_use "$port"; then
     err "SSH is not listening on port $port — reverting"
     if [[ -n $bak ]]; then cp -a "$bak" "$conf"; else rm -f "$conf"; fi
     ssh_restart || true
@@ -743,14 +784,63 @@ ssl_session_timeout 1d;
 ssl_session_cache shared:SrvSSL:10m;
 ssl_session_tickets off;
 EOF
+
+  cat >/etc/nginx/snippets/srv-proxy.conf <<'EOF'
+# Managed by srv — shared reverse-proxy settings (Host and Connection are set per site)
+proxy_http_version 1.1;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header X-Forwarded-Host $host;
+proxy_set_header X-Forwarded-Port $server_port;
+proxy_connect_timeout 10s;
+proxy_buffer_size 16k;
+proxy_buffers 8 16k;
+proxy_busy_buffers_size 32k;
+proxy_hide_header X-Powered-By;
+EOF
+}
+
+# Shared Nginx files used by site configs. Rewritten on every site change,
+# so servers set up by an older srv pick up new snippets automatically.
+nginx_sync_shared() {
+  [[ -d /etc/nginx ]] || return 0
+  install -d -m 755 "$ACME_ROOT" "$NGINX_CUSTOM" /etc/nginx/snippets /etc/nginx/conf.d
+  nginx_write_snippets
+  local maps=/etc/nginx/conf.d/01-srv-maps.conf
+  if grep -rqsE --exclude=01-srv-maps.conf 'map[[:space:]]+\$http_upgrade[[:space:]]+\$connection_upgrade' \
+       /etc/nginx/nginx.conf /etc/nginx/conf.d /etc/nginx/sites-enabled; then
+    rm -f "$maps"   # already defined elsewhere — defining it twice is fatal
+  else
+    cat >"$maps" <<'EOF'
+# Managed by srv — WebSocket upgrade helper
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+EOF
+  fi
+  # Site logs: PHP errors and app/worker output. copytruncate because the
+  # process managers keep these files open.
+  cat >/etc/logrotate.d/srv-sites <<'EOF'
+/var/www/*/logs/*.log {
+    su root root
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+EOF
 }
 
 mod_nginx() {
   step "Installing Nginx"
   apt_install nginx
-  install -d -m 755 "$ACME_ROOT" "$NGINX_CUSTOM" /etc/nginx/snippets
   nginx_write_global
-  nginx_write_snippets
+  nginx_sync_shared
 
   # Catch-all: unknown hostnames / bare IP get the connection closed
   rm -f /etc/nginx/sites-enabled/default
@@ -765,18 +855,6 @@ mod_nginx() {
     echo "}"
   } >/etc/nginx/sites-available/000-srv-default.conf
   ln -sfn /etc/nginx/sites-available/000-srv-default.conf /etc/nginx/sites-enabled/000-srv-default.conf
-
-  # PHP error logs inside each site (Nginx logs live in /var/log/nginx)
-  cat >/etc/logrotate.d/srv-sites <<'EOF'
-/var/www/*/logs/*.log {
-    daily
-    rotate 14
-    missingok
-    notifempty
-    compress
-    delaycompress
-}
-EOF
 
   if ! nginx -t >>"$SRV_LOG" 2>&1; then
     warn "Catch-all server conflicts with existing config — removing it"
@@ -843,7 +921,7 @@ mod_php() {
     return 1
   fi
   local -a pkgs=()
-  for ext in fpm cli common mysql curl mbstring xml zip bcmath intl gd readline sqlite3 opcache; do
+  for ext in fpm cli common mysql pgsql redis curl mbstring xml zip bcmath intl gd readline sqlite3 opcache; do
     if pkg_available "php$v-$ext"; then pkgs+=("php$v-$ext"); fi
   done
   apt_install "${pkgs[@]}"
@@ -876,6 +954,16 @@ EOF
   ok "PHP $v installed (FPM running)"
 }
 
+# Install a PHP extension (redis, pgsql …) for every installed PHP version
+php_ext_all() {
+  local ext=$1 v
+  for v in $(php_versions); do
+    if ! pkg_installed "php$v-$ext" && pkg_available "php$v-$ext"; then
+      apt_install "php$v-$ext" && run systemctl restart "php$v-fpm" || warn "Couldn't install php$v-$ext"
+    fi
+  done
+}
+
 # ── composer ─────────────────────────────────────────────────────────────────
 mod_composer() {
   step "Installing Composer"
@@ -890,7 +978,7 @@ mod_composer() {
   ok "Composer $(feat_get composer) installed"
 }
 
-# ── database ─────────────────────────────────────────────────────────────────
+# ── database (MariaDB / MySQL) ───────────────────────────────────────────────
 ask_database() {
   if [[ -n $OPT_DB_ENGINE ]]; then return 0; fi
   local -a items=(mariadb "MariaDB (recommended — MySQL compatible)")
@@ -958,6 +1046,352 @@ SQL
   ok "$eng running (localhost only, buffer pool ${pool}M)"
 }
 
+# ── postgres ─────────────────────────────────────────────────────────────────
+pg_port()  { cfg_get PG_PORT 5432; }
+pg_psql()  { runuser -u postgres -- env -C / psql -X -q -v ON_ERROR_STOP=1 -p "$(pg_port)" "$@"; }
+pg_sql()   { pg_psql -At -F $'\t' -d postgres -c "$1"; }   # non-secret SQL only
+pg_run()   { pg_psql -d postgres; }                        # SQL from stdin
+pg_exists()      { [[ $(pg_sql "SELECT 1 FROM pg_database WHERE datname='$1'" 2>/dev/null) == 1 ]]; }
+pg_user_exists() { [[ $(pg_sql "SELECT 1 FROM pg_roles WHERE rolname='$1'" 2>/dev/null) == 1 ]]; }
+pg_user_databases() { pg_sql "SELECT datname FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres' ORDER BY 1"; }
+
+pg_create() {
+  local n=$1 u=$2 p=$3
+  if ! valid_db_ident "$n" || ! valid_db_ident "$u"; then err "Invalid database or user name"; return 1; fi
+  log "SQL   create PostgreSQL database $n, role $u"
+  if ! pg_run >>"$SRV_LOG" 2>&1 <<SQL
+CREATE ROLE "$u" LOGIN PASSWORD '$p';
+CREATE DATABASE "$n" OWNER "$u" ENCODING 'UTF8' TEMPLATE template0;
+REVOKE ALL ON DATABASE "$n" FROM PUBLIC;
+SQL
+  then err "Failed to create PostgreSQL database $n"; return 1; fi
+}
+
+pg_available_versions() {
+  { apt-cache search --names-only '^postgresql-[0-9]+$' 2>/dev/null || true; } | awk '{print $1}' | sed 's/^postgresql-//' | sort -n
+}
+
+ask_postgres() {
+  if [[ -n $OPT_PG ]]; then return 0; fi
+  OPT_PG=$(ui_menu "PostgreSQL" "Choose the PostgreSQL version:" \
+    latest "Newest available (recommended)" \
+    18     "PostgreSQL 18" \
+    17     "PostgreSQL 17" \
+    16     "PostgreSQL 16") || die "Cancelled."
+}
+
+pg_repo_setup() {
+  if grep -rqs 'apt.postgresql.org' /etc/apt/sources.list /etc/apt/sources.list.d/; then return 0; fi
+  info "Adding the official PostgreSQL (PGDG) repository"
+  apt_install ca-certificates curl || return 1
+  install -d -m 755 /usr/share/postgresql-common/pgdg
+  run curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc || return 1
+  echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $OS_CODENAME-pgdg main" \
+    >/etc/apt/sources.list.d/srv-pgdg.list
+  if ! apt_update force; then
+    rm -f /etc/apt/sources.list.d/srv-pgdg.list
+    warn "The PGDG repository isn't available for $OS_CODENAME — using the distro's PostgreSQL."
+    apt_update force || true
+  fi
+}
+
+mod_postgres() {
+  step "Installing PostgreSQL"
+  pg_repo_setup || return 1
+  local v=${OPT_PG:-latest} existing mb sb ec dir port i
+  if [[ $v == latest ]]; then v=$(pg_available_versions | tail -n 1); fi
+  [[ -n $v ]] || { err "No PostgreSQL packages found"; return 1; }
+  existing=$({ pg_lsclusters -h 2>/dev/null || true; } | awk '{print $1}' | sort -u | tr '\n' ' ')
+  existing=${existing% }
+  if [[ -n $existing && $existing != "$v" ]]; then
+    err "PostgreSQL $existing is already installed. srv manages a single PostgreSQL version."
+    return 1
+  fi
+  if ! pkg_available "postgresql-$v"; then
+    err "PostgreSQL $v isn't available. Available: $(pg_available_versions | tr '\n' ' ')"
+    return 1
+  fi
+  apt_install "postgresql-$v" "postgresql-client-$v"
+
+  dir="/etc/postgresql/$v/main"
+  [[ -d $dir ]] || { err "Cluster config $dir not found"; return 1; }
+  mb=$(mem_mb)
+  sb=$(( mb / 4 )); if (( sb < 128 )); then sb=128; fi; if (( sb > 8192 )); then sb=8192; fi
+  ec=$(( mb / 2 )); if (( ec < 256 )); then ec=256; fi
+  install -d -o postgres -g postgres "$dir/conf.d"
+  if ! grep -qE "^[[:space:]]*include_dir[[:space:]]*=[[:space:]]*'conf\.d'" "$dir/postgresql.conf"; then
+    echo "include_dir = 'conf.d'" >>"$dir/postgresql.conf"
+  fi
+  cat >"$dir/conf.d/99-srv.conf" <<EOF
+# Managed by srv
+listen_addresses = 'localhost'
+password_encryption = scram-sha-256
+max_connections = 100
+shared_buffers = ${sb}MB
+effective_cache_size = ${ec}MB
+EOF
+  if [[ ! -f $dir/pg_hba.conf.srv-orig ]]; then cp -a "$dir/pg_hba.conf" "$dir/pg_hba.conf.srv-orig"; fi
+  cat >"$dir/pg_hba.conf" <<'EOF'
+# Managed by srv — local connections only (original saved as pg_hba.conf.srv-orig)
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+local   all             postgres                                peer
+local   all             all                                     peer
+host    all             all             127.0.0.1/32            scram-sha-256
+host    all             all             ::1/128                 scram-sha-256
+local   replication     all                                     peer
+host    replication     all             127.0.0.1/32            scram-sha-256
+host    replication     all             ::1/128                 scram-sha-256
+EOF
+  chown postgres:postgres "$dir/pg_hba.conf" "$dir/conf.d/99-srv.conf"
+  chmod 640 "$dir/pg_hba.conf"
+
+  run systemctl enable postgresql
+  run systemctl restart "postgresql@$v-main" || run systemctl restart postgresql || return 1
+  port=$({ pg_lsclusters -h 2>/dev/null || true; } | awk -v v="$v" '$1==v && $2=="main" {print $3}')
+  cfg_set PG_PORT "${port:-5432}"
+  cfg_set PG_VERSION "$v"
+  for (( i = 0; i < 20; i++ )); do
+    if runuser -u postgres -- pg_isready -q -p "$(pg_port)" 2>/dev/null; then break; fi
+    sleep 1
+  done
+  pg_sql "SELECT 1" >/dev/null 2>>"$SRV_LOG" || { err "PostgreSQL isn't accepting connections — see $SRV_LOG"; return 1; }
+  php_ext_all pgsql
+  feat_set postgres "PostgreSQL $v (port $(pg_port))"
+  ok "PostgreSQL $v running (localhost only, shared_buffers ${sb}MB)"
+}
+
+# ── Engine-agnostic database helpers (mysql = MySQL/MariaDB, pgsql = PostgreSQL)
+norm_engine() {
+  case ${1,,} in
+    mysql|mariadb) echo mysql ;;
+    pgsql|pg|postgres|postgresql) echo pgsql ;;
+    *) return 1 ;;
+  esac
+}
+eng_installed()    { if [[ $1 == pgsql ]]; then feat_has postgres; else feat_has database; fi; }
+eng_label()        { if [[ $1 == pgsql ]]; then echo PostgreSQL; else echo "MySQL/MariaDB"; fi; }
+eng_port()         { if [[ $1 == pgsql ]]; then pg_port; else echo 3306; fi; }
+eng_exists()       { if [[ $1 == pgsql ]]; then pg_exists "$2"; else db_exists "$2"; fi; }
+eng_user_exists()  { if [[ $1 == pgsql ]]; then pg_user_exists "$2"; else db_user_exists "$2"; fi; }
+eng_create()       { if [[ $1 == pgsql ]]; then pg_create "$2" "$3" "$4"; else db_create "$2" "$3" "$4"; fi; }
+eng_databases()    { if [[ $1 == pgsql ]]; then pg_user_databases; else db_user_databases; fi; }
+eng_drop_db() {
+  if [[ $1 == pgsql ]]; then printf 'DROP DATABASE IF EXISTS "%s" WITH (FORCE);\n' "$2" | pg_run >>"$SRV_LOG" 2>&1
+  else printf 'DROP DATABASE IF EXISTS `%s`;\n' "$2" | db_run >>"$SRV_LOG" 2>&1; fi
+}
+eng_drop_user() {
+  if [[ $1 == pgsql ]]; then printf 'DROP ROLE IF EXISTS "%s";\n' "$2" | pg_run >>"$SRV_LOG" 2>&1
+  else printf "DROP USER IF EXISTS '%s'@'localhost';\n" "$2" | db_run >>"$SRV_LOG" 2>&1; fi
+}
+eng_set_password() {
+  local e=$1 u=$2 p=$3
+  if [[ $e == pgsql ]]; then
+    pg_run >>"$SRV_LOG" 2>&1 <<SQL
+ALTER ROLE "$u" PASSWORD '$p';
+SQL
+  else
+    db_run >>"$SRV_LOG" 2>&1 <<SQL
+ALTER USER '$u'@'localhost' IDENTIFIED BY '$p';
+FLUSH PRIVILEGES;
+SQL
+  fi
+}
+db_engines() {
+  if feat_has database; then echo mysql; fi
+  if feat_has postgres; then echo pgsql; fi
+  return 0
+}
+
+# db_pick_engine [requested] [install] → sets DB_ENG
+db_pick_engine() {
+  local req=${1:-} mode=${2:-}
+  local -a e=()
+  if [[ -n $req ]]; then
+    req=$(norm_engine "$req") || die "Unknown database engine: $1 (use mysql or pgsql)"
+    if [[ $req == pgsql ]]; then ensure_feature postgres; else ensure_feature database; fi
+    DB_ENG=$req; return 0
+  fi
+  mapfile -t e < <(db_engines)
+  case ${#e[@]} in
+    0)
+      if (( INTERACTIVE )) && [[ $mode == install ]]; then
+        req=$(ui_menu "Database" "No database server is installed yet. Install:" \
+          mysql "MariaDB / MySQL" pgsql "PostgreSQL") || die "Cancelled."
+        db_pick_engine "$req"; return 0
+      fi
+      die "No database server installed. Run: srv install database   (or: srv install postgres)" ;;
+    1) DB_ENG=${e[0]} ;;
+    *)
+      if (( ! INTERACTIVE )); then die "Both MySQL/MariaDB and PostgreSQL are installed — add --mysql or --pg."; fi
+      DB_ENG=$(ui_menu "Database engine" "Which database server?" mysql "MySQL / MariaDB" pgsql "PostgreSQL") || die "Cancelled." ;;
+  esac
+}
+
+# ── redis ────────────────────────────────────────────────────────────────────
+ask_redis() {
+  if [[ -n $OPT_REDIS_POLICY ]]; then return 0; fi
+  OPT_REDIS_POLICY=$(ui_menu "Redis" "When Redis memory is full:" \
+    volatile-lru "Evict cache keys (with a TTL), keep queues (recommended)" \
+    allkeys-lru  "Evict any key — Redis is only a cache" \
+    noeviction   "Never evict — reject writes (queues/data only)") || die "Cancelled."
+}
+mod_redis() {
+  step "Installing Redis"
+  apt_install redis-server redis-tools
+  local pass mem policy=${OPT_REDIS_POLICY:-volatile-lru} f=/etc/redis/srv.conf main=/etc/redis/redis.conf i
+  pass=$(cfg_get REDIS_PASSWORD); if [[ -z $pass ]]; then pass=$(gen_password 32); fi
+  mem=$(( $(mem_mb) / 8 )); if (( mem < 64 )); then mem=64; fi; if (( mem > 4096 )); then mem=4096; fi
+  cat >"$f" <<EOF
+# Managed by srv — included at the end of $main (later values win)
+bind 127.0.0.1
+protected-mode yes
+port 6379
+requirepass $pass
+maxmemory ${mem}mb
+maxmemory-policy $policy
+EOF
+  chown redis:redis "$f"; chmod 640 "$f"
+  if ! grep -qxF "include $f" "$main"; then printf '\ninclude %s\n' "$f" >>"$main"; fi
+  cfg_set REDIS_PASSWORD "$pass"
+  run systemctl enable redis-server
+  run systemctl restart redis-server
+  for (( i = 0; i < 10; i++ )); do
+    if [[ $(REDISCLI_AUTH=$pass redis-cli -h 127.0.0.1 ping 2>/dev/null) == PONG ]]; then break; fi
+    sleep 1
+  done
+  [[ $(REDISCLI_AUTH=$pass redis-cli -h 127.0.0.1 ping 2>/dev/null) == PONG ]] || { err "Redis isn't answering — see $SRV_LOG"; return 1; }
+  php_ext_all redis
+  feat_set redis "$(redis-server --version | sed -n 's/.*v=\([0-9.]*\).*/\1/p'), ${mem}mb, $policy"
+  ok "Redis running on 127.0.0.1:6379 (password protected, ${mem}MB, $policy)"
+}
+
+# ── node ─────────────────────────────────────────────────────────────────────
+# Official Node.js builds (checksum-verified) in /opt/srv/node/versions/<vX.Y.Z>,
+# with a stable /opt/srv/node/<major> link that sites and services point at.
+ask_node() {
+  if [[ -n $OPT_NODE ]]; then return 0; fi
+  OPT_NODE=$(ui_menu "Node.js" "Choose the Node.js version to install (more can be added later):" \
+    lts    "Latest LTS (recommended)" \
+    24     "Node.js 24" \
+    22     "Node.js 22" \
+    26     "Node.js 26" \
+    latest "Latest current release") || die "Cancelled."
+}
+
+node_arch() {
+  case $(uname -m) in
+    x86_64|amd64)  echo x64 ;;
+    aarch64|arm64) echo arm64 ;;
+    armv7l)        echo armv7l ;;
+    *) return 1 ;;
+  esac
+}
+
+node_resolve() {   # lts | latest | <major>  → vX.Y.Z
+  local spec=$1 idx="$TMP_DIR/node-index.tab"
+  if [[ ! -s $idx ]]; then curl -fsSL -o "$idx" https://nodejs.org/dist/index.tab 2>>"$SRV_LOG" || return 1; fi
+  case $spec in
+    lts)    awk -F'\t' 'NR > 1 && $10 != "-" {print $1}' "$idx" ;;
+    latest) awk -F'\t' 'NR > 1 {print $1}' "$idx" ;;
+    *)      awk -F'\t' -v m="v$spec." 'NR > 1 && index($1, m) == 1 {print $1}' "$idx" ;;
+  esac | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1
+}
+
+node_versions() {
+  local l
+  for l in "$NODE_ROOT"/*; do
+    if [[ -L $l && -x $l/bin/node ]]; then basename "$l"; fi
+  done | sort -n
+}
+node_full() { basename "$(readlink "$NODE_ROOT/$1")"; }
+
+node_link_default() {
+  local m=$1 b
+  for b in node npm npx corepack; do
+    if [[ -e $NODE_ROOT/$m/bin/$b ]]; then ln -sfn "$NODE_ROOT/$m/bin/$b" "/usr/local/bin/$b"; fi
+  done
+}
+
+node_install_version() {
+  local spec=$1 ver arch major dir tarball
+  arch=$(node_arch) || { err "Unsupported CPU architecture: $(uname -m)"; return 1; }
+  ver=$(node_resolve "$spec") || ver=""
+  [[ $ver =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { err "Couldn't find Node.js '$spec' on nodejs.org"; return 1; }
+  major=${ver#v}; major=${major%%.*}
+  dir="$NODE_ROOT/versions/$ver"
+  if [[ ! -x $dir/bin/node ]]; then
+    tarball="node-$ver-linux-$arch.tar.xz"
+    info "Downloading Node.js $ver"
+    run curl -fsSL -o "$TMP_DIR/$tarball" "https://nodejs.org/dist/$ver/$tarball" || return 1
+    run curl -fsSL -o "$TMP_DIR/SHASUMS256.txt" "https://nodejs.org/dist/$ver/SHASUMS256.txt" || return 1
+    if ! ( cd "$TMP_DIR" && grep -E "  $tarball\$" SHASUMS256.txt | sha256sum -c --status ); then
+      err "Checksum mismatch for $tarball — aborting"; return 1
+    fi
+    rm -rf "$dir.tmp"; mkdir -p "$dir.tmp"
+    tar -xJf "$TMP_DIR/$tarball" -C "$dir.tmp" --strip-components=1 --no-same-owner || { err "Extracting $tarball failed"; return 1; }
+    mv "$dir.tmp" "$dir"
+  else
+    info "Node.js $ver is already present"
+  fi
+  # pnpm / yarn through corepack (Node 25+ no longer bundles it)
+  if [[ ! -x $dir/bin/corepack ]]; then
+    run env PATH="$dir/bin:/usr/bin:/bin" npm install -g --no-fund --no-audit corepack || warn "Couldn't install corepack — pnpm/yarn projects won't work"
+  fi
+  if [[ -x $dir/bin/corepack ]]; then
+    run env PATH="$dir/bin:/usr/bin:/bin" COREPACK_ENABLE_DOWNLOAD_PROMPT=0 corepack enable || warn "corepack enable failed"
+  fi
+  chmod -R a+rX "$dir"
+  ln -sfn "versions/$ver" "$NODE_ROOT/$major"
+  NODE_LAST_MAJOR=$major
+}
+
+mod_node() {
+  local spec=${OPT_NODE:-lts}
+  step "Installing Node.js ($spec)"
+  apt_install xz-utils build-essential python3 || return 1
+  install -d -m 755 "$NODE_ROOT/versions"
+  node_install_version "$spec" || return 1
+  if [[ -z $(cfg_get NODE_DEFAULT) || ! -x $NODE_ROOT/$(cfg_get NODE_DEFAULT)/bin/node ]]; then cfg_set NODE_DEFAULT "$NODE_LAST_MAJOR"; fi
+  node_link_default "$(cfg_get NODE_DEFAULT)"
+  feat_set node "$(node_versions | tr '\n' ' ' | sed 's/ $//') (default $(cfg_get NODE_DEFAULT))"
+  ok "Node.js $(node_full "$NODE_LAST_MAJOR") installed → $NODE_ROOT/$NODE_LAST_MAJOR"
+  local d n=0
+  while IFS= read -r d; do
+    if [[ -n $d && $(site_get "$d" TYPE) == node && $(site_get "$d" NODE) == "$NODE_LAST_MAJOR" && $(site_get "$d" APP_ACTIVE) == yes ]]; then n=$(( n + 1 )); fi
+  done < <(site_list_domains)
+  if (( n )); then info "$n running app(s) use Node $NODE_LAST_MAJOR — restart them to use the new version: srv app restart <domain>"; fi
+}
+
+# ── python ───────────────────────────────────────────────────────────────────
+mod_python() {
+  step "Installing Python"
+  apt_install python3 python3-venv python3-pip python3-dev build-essential pkg-config \
+              libffi-dev libssl-dev libpq-dev default-libmysqlclient-dev
+  feat_set python "$(python3 -V 2>&1 | awk '{print $2}')"
+  ok "Python $(feat_get python) ready (each app gets its own virtualenv)"
+}
+
+# ── supervisor ───────────────────────────────────────────────────────────────
+mod_supervisor() {
+  step "Installing Supervisor"
+  apt_install supervisor
+  run systemctl enable --now supervisor
+  feat_set supervisor "$(supervisord -v 2>/dev/null || echo installed)"
+  ok "Supervisor running"
+}
+
+# ── pm2 ──────────────────────────────────────────────────────────────────────
+mod_pm2() {
+  feat_has node || { err "Node.js is required for PM2 — run: srv install node"; return 1; }
+  step "Installing PM2"
+  local def; def=$(cfg_get NODE_DEFAULT)
+  run env PATH="$NODE_ROOT/$def/bin:/usr/bin:/bin" npm install -g --no-fund --no-audit --prefix "$PM2_PREFIX" pm2@latest || return 1
+  chmod -R a+rX "$PM2_PREFIX"
+  ln -sfn "$PM2_PREFIX/bin/pm2" /usr/local/bin/pm2
+  feat_set pm2 "$(sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' "$PM2_PREFIX/lib/node_modules/pm2/package.json" | head -n 1)"
+  ok "PM2 $(feat_get pm2) installed (each app runs in its own user's PM2)"
+}
+
 # ── certbot ──────────────────────────────────────────────────────────────────
 ask_certbot() {
   local e
@@ -997,22 +1431,24 @@ ask_backup() {
   OPT_BACKUP_KEEP=$d
 }
 mod_backup() {
-  feat_has database || { err "A database server is required first — run: srv install database"; return 1; }
+  if ! feat_has database && ! feat_has postgres; then
+    err "A database server is required first — run: srv install database  (or: srv install postgres)"; return 1
+  fi
   step "Scheduling daily database backups"
   self_install
   [[ -x $SRV_BIN ]] || { err "$SRV_BIN is missing — copy srv.sh there first"; return 1; }
   local keep=${OPT_BACKUP_KEEP:-$(cfg_get BACKUP_KEEP_DAYS 7)}
   cfg_set BACKUP_KEEP_DAYS "$keep"
-  install -d -m 700 "$BACKUP_DIR" "$BACKUP_DIR/db"
+  install -d -m 700 "$BACKUP_DIR"
   cat >/etc/cron.d/srv-backup <<EOF
-# Managed by srv — daily database backups
+# Managed by srv — daily database backups (MySQL/MariaDB and PostgreSQL)
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 30 2 * * * root $SRV_BIN backup db --all >>/var/log/srv-backup.log 2>&1
 EOF
   chmod 644 /etc/cron.d/srv-backup
   feat_set backup "daily 02:30, keep ${keep}d"
-  ok "Daily backups at 02:30 → $BACKUP_DIR/db (kept $keep days)"
+  ok "Daily backups at 02:30 → $BACKUP_DIR (kept $keep days)"
 }
 
 # ── Feature orchestration ────────────────────────────────────────────────────
@@ -1027,6 +1463,9 @@ feature_summary() {
       ssh)       extra="port $OPT_SSH_PORT, root login: $OPT_ROOT_LOGIN, passwords: $([[ $OPT_SSH_NOPASS == yes ]] && echo off || echo on)" ;;
       php)       extra="PHP $OPT_PHP" ;;
       database)  extra=$OPT_DB_ENGINE ;;
+      postgres)  extra="PostgreSQL $OPT_PG" ;;
+      redis)     extra="memory policy: $OPT_REDIS_POLICY" ;;
+      node)      extra="Node.js $OPT_NODE" ;;
       certbot)   extra=${OPT_EMAIL:-no email} ;;
       backup)    extra="keep $OPT_BACKUP_KEEP days" ;;
       *)         extra="" ;;
@@ -1044,7 +1483,9 @@ run_module() {
 install_features() {
   local -a want=("$@") final=(); local f
   if in_list composer "${want[@]}" && ! in_list php "${want[@]}" && ! feat_has php; then want+=(php); info "Adding php (required by composer)"; fi
-  if in_list backup "${want[@]}" && ! in_list database "${want[@]}" && ! feat_has database; then want+=(database); info "Adding database (required by backup)"; fi
+  if in_list pm2 "${want[@]}" && ! in_list node "${want[@]}" && ! feat_has node; then want+=(node); info "Adding node (required by pm2)"; fi
+  if in_list backup "${want[@]}" && ! in_list database "${want[@]}" && ! in_list postgres "${want[@]}" \
+     && ! feat_has database && ! feat_has postgres; then want+=(database); info "Adding database (required by backup)"; fi
   for f in "${FEATURES[@]}"; do
     if in_list "$f" "${want[@]}"; then final+=("$f"); fi
   done
@@ -1123,23 +1564,30 @@ cmd_install() {
     local -a items=(); local x desc
     for x in "${FEATURES[@]}"; do
       desc=$(feat_desc "$x")
-      if [[ $x == php ]] && feat_has php; then desc="$desc [installed: $(feat_get php) — add another]"
+      if [[ $x == php || $x == node ]] && feat_has "$x"; then desc="$desc [installed: $(feat_get "$x") — add another]"
       elif [[ $x != upgrade ]] && feat_has "$x"; then desc="$desc [installed — reconfigure]"; fi
       items+=("$x" "$desc" OFF)
     done
     mapfile -t todo < <(ui_checklist "Install features" "Select features to install (space = toggle):" "${items[@]}")
   else
     case $f in
-      mysql|mariadb) OPT_DB_ENGINE=$f; f=database ;;
-      ufw) f=firewall ;;
-      ssl|letsencrypt) f=certbot ;;
+      mysql|mariadb)          OPT_DB_ENGINE=$f; f=database ;;
+      postgresql|pgsql|pg)    f=postgres ;;
+      nodejs)                 f=node ;;
+      redis-server)           f=redis ;;
+      ufw)                    f=firewall ;;
+      ssl|letsencrypt)        f=certbot ;;
     esac
-    if [[ $f == php && -n ${1:-} ]]; then
-      [[ $1 =~ ^[0-9]+\.[0-9]+$ ]] || die "PHP version must look like 8.3"
-      OPT_PHP=$1
-    fi
     in_list "$f" "${FEATURES[@]}" || die "Unknown feature: $f. Available: ${FEATURES[*]}"
-    if [[ $f != php && $f != upgrade ]] && feat_has "$f"; then
+    if [[ -n ${1:-} ]]; then
+      case $f in
+        php)      [[ $1 =~ ^[0-9]+\.[0-9]+$ ]] || die "PHP version must look like 8.3"; OPT_PHP=$1 ;;
+        node)     [[ $1 =~ ^([0-9]+|lts|latest)$ ]] || die "Node.js version must be a major version (e.g. 22), lts or latest"; OPT_NODE=$1 ;;
+        postgres) [[ $1 =~ ^[0-9]+$ ]] || die "PostgreSQL version must be a number (e.g. 17)"; OPT_PG=$1 ;;
+        *) die "'$f' doesn't take a version." ;;
+      esac
+    fi
+    if [[ $f != php && $f != node && $f != upgrade ]] && feat_has "$f"; then
       ui_yesno "'$f' is already installed ($(feat_get "$f")). Run its setup again?" no || { info "Nothing to do."; return 0; }
     fi
     todo=("$f")
@@ -1155,6 +1603,10 @@ site_exists()  { [[ -f $(site_file "$1") ]]; }
 site_get()     { kv_get "$(site_file "$1")" "$2" "${3-}"; }
 site_set()     { kv_set "$(site_file "$1")" "$2" "$3"; }
 site_docroot() { local w; w=$(site_get "$1" WEBROOT); printf '%s' "$(site_get "$1" APP_DIR)${w:+/$w}"; }
+
+is_php_type()   { [[ $1 == php || $1 == laravel ]]; }
+is_app_type()   { [[ $1 == node || $1 == python ]]; }
+is_proxy_type() { [[ $1 == node || $1 == python || $1 == proxy ]]; }
 
 site_list_domains() {
   local f
@@ -1181,25 +1633,56 @@ site_user_for() {
   printf '%s' "$u"
 }
 
+laravel_conf() { printf '/etc/supervisor/conf.d/srv-%s-laravel.conf' "$(site_get "$1" SITE_USER)"; }
+site_has_process() {   # node/python apps, and Laravel sites with workers
+  local t; t=$(site_get "$1" TYPE)
+  is_app_type "$t" || { [[ $t == laravel && -f $(laravel_conf "$1") ]]; }
+}
+
+site_runtime() {
+  case $(site_get "$1" TYPE) in
+    php|laravel) echo "php$(site_get "$1" PHP)" ;;
+    node)        echo "node$(site_get "$1" NODE)" ;;
+    python)      echo "python" ;;
+    proxy)       echo "proxy" ;;
+    *)           echo "-" ;;
+  esac
+}
+
+# pick_site [apps]  → interactive site picker ("apps" = only sites with processes)
 pick_site() {
-  local -a items=(); local d ssl
+  local filter=${1:-} d ssl
+  local -a items=()
   while IFS= read -r d; do
     [[ -n $d ]] || continue
+    if [[ $filter == apps ]] && ! site_has_process "$d"; then continue; fi
     ssl=""; if [[ $(site_get "$d" SSL) == yes ]]; then ssl=", https"; fi
     items+=("$d" "$(site_get "$d" TYPE)$ssl")
   done < <(site_list_domains)
-  (( ${#items[@]} )) || { warn "No sites yet — create one with: srv site add"; return 1; }
+  if (( ! ${#items[@]} )); then
+    if [[ $filter == apps ]]; then warn "No apps yet — create one with: srv site add --type node|python"
+    else warn "No sites yet — create one with: srv site add"; fi
+    return 1
+  fi
   if (( ! INTERACTIVE )); then err "Specify the domain."; return 1; fi
   ui_menu "Sites" "Select a site:" "${items[@]}"
 }
 
-# resolve_domain [domain] → prints an existing site's domain (asks if missing)
+# resolve_domain [domain] [apps] → prints an existing site's domain (asks if missing)
 resolve_domain() {
   local d=${1:-}
   d=${d,,}
-  if [[ -z $d ]]; then d=$(pick_site) || die "No site selected."; fi
+  if [[ -z $d ]]; then d=$(pick_site "${2:-}") || die "No site selected."; fi
   site_exists "$d" || die "Site not found: $d (see: srv site list)"
   printf '%s' "$d"
+}
+
+normalize_upstream() {
+  local u=$1
+  if [[ $u != http://* && $u != https://* ]]; then u="http://$u"; fi
+  u=${u%/}
+  [[ $u =~ ^https?://([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:]+\])(:[0-9]{1,5})?$ ]] || return 1
+  printf '%s' "$u"
 }
 
 # ── Config rendering ─────────────────────────────────────────────────────────
@@ -1211,9 +1694,9 @@ site_render_pool() {
   for f in /etc/php/*/fpm/pool.d/srv-"$user".conf; do
     [[ -f $f ]] || continue
     v=${f#/etc/php/}; v=${v%%/*}
-    if [[ $v != "$php" || ( $type != php && $type != laravel ) ]]; then rm -f "$f"; reload+=("$v"); fi
+    if [[ $v != "$php" ]] || ! is_php_type "$type"; then rm -f "$f"; reload+=("$v"); fi
   done
-  if [[ $type == php || $type == laravel ]]; then
+  if is_php_type "$type"; then
     [[ -d /etc/php/$php/fpm/pool.d ]] || { err "PHP $php-FPM is not installed (srv install php $php)"; return 1; }
     cat >"/etc/php/$php/fpm/pool.d/srv-$user.conf" <<EOF
 ; Managed by srv — regenerate with: srv site rebuild $d
@@ -1248,10 +1731,82 @@ EOF
   done
 }
 
+nginx_resolver() {
+  local ns
+  ns=$(awk '$1 == "nameserver" && $2 !~ /%/ {print $2}' /etc/resolv.conf 2>/dev/null | head -n 3 | sed -E 's/^(.*:.*)$/[\1]/' | tr '\n' ' ')
+  ns=${ns% }
+  printf '%s' "${ns:-127.0.0.53}"
+}
+
+site_nginx_proxy_body() {
+  local d=$1 type=$2 app target ws timeout host_hdr body
+  app=$(site_get "$d" APP_DIR)
+  if [[ $type == proxy ]]; then target=$(site_get "$d" UPSTREAM); else target="http://127.0.0.1:$(site_get "$d" PORT)"; fi
+  ws=$(site_get "$d" WEBSOCKET yes); timeout=$(site_get "$d" TIMEOUT 60); body=$(site_get "$d" MAX_BODY)
+  # shellcheck disable=SC2016
+  host_hdr='$host'
+  # shellcheck disable=SC2016
+  if [[ $(site_get "$d" PRESERVE_HOST yes) != yes ]]; then host_hdr='$proxy_host'; fi
+  if [[ $ws == yes ]] && (( timeout < 3600 )); then timeout=3600; fi   # keep idle WebSockets open
+  cat <<EOF
+
+    access_log /var/log/nginx/$d.access.log;
+    error_log  /var/log/nginx/$d.error.log warn;
+
+    include snippets/srv-security.conf;
+    include $NGINX_CUSTOM/$d/*.conf;
+EOF
+  if [[ -n $body ]]; then printf '    client_max_body_size %s;\n' "$body"; fi
+  if [[ $type == python && $(site_get "$d" PY_FRAMEWORK) == django ]]; then
+    cat <<EOF
+
+    # Django: collectstatic output (STATIC_ROOT) and uploads (MEDIA_ROOT)
+    location ^~ /static/ {
+        alias $app/$(site_get "$d" STATIC_DIR staticfiles)/;
+        expires 30d;
+        access_log off;
+    }
+
+    location ^~ /media/ {
+        alias $app/$(site_get "$d" MEDIA_DIR media)/;
+        expires 7d;
+    }
+EOF
+  fi
+  # Hostname upstreams are resolved per request (via a variable + resolver), so a
+  # DNS failure can't stop Nginx from starting or reloading for every other site.
+  local uhost=${target#*://}; uhost=${uhost%%/*}; uhost=${uhost%:*}
+  echo
+  echo "    location / {"
+  if [[ $type == proxy && ! $uhost =~ ^[0-9.]+$ && $uhost != localhost && $uhost != \[* ]]; then
+    echo "        resolver $(nginx_resolver) valid=60s;"
+    echo "        resolver_timeout 5s;"
+    echo "        set \$srv_upstream $target;"
+    echo "        proxy_pass \$srv_upstream;"
+  else
+    echo "        proxy_pass $target;"
+  fi
+  echo "        include snippets/srv-proxy.conf;"
+  echo "        proxy_set_header Host $host_hdr;"
+  if [[ $ws == yes ]]; then
+    # shellcheck disable=SC2016
+    printf '        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n'
+  else
+    echo '        proxy_set_header Connection "";'
+  fi
+  echo "        proxy_read_timeout ${timeout}s;"
+  echo "        proxy_send_timeout ${timeout}s;"
+  if [[ $target == https://* ]]; then echo "        proxy_ssl_server_name on;"; fi
+  echo "    }"
+}
+
 site_nginx_body() {
-  local d=$1 type=$2 root=$3 user=$4
-  local sock="/run/php/srv-$user.sock" index="index.html index.htm" tpl
-  if [[ $type == php || $type == laravel ]]; then index="index.php index.html"; fi
+  local d=$1 type user root sock index tpl
+  type=$(site_get "$d" TYPE)
+  if is_proxy_type "$type"; then site_nginx_proxy_body "$d" "$type"; return 0; fi
+  user=$(site_get "$d" SITE_USER); root=$(site_docroot "$d")
+  sock="/run/php/srv-$user.sock"; index="index.html index.htm"
+  if is_php_type "$type"; then index="index.php index.html"; fi
   cat <<EOF
 
     root $root;
@@ -1368,13 +1923,37 @@ EOF
 ) ;;
   esac
   printf '%s\n' "${tpl//__SOCK__/$sock}"
+
+  if [[ $type == laravel && $(site_get "$d" REVERB) == yes && -n $(site_get "$d" REVERB_PORT) ]]; then
+    tpl=$(cat <<'EOF'
+
+    # Laravel Reverb (srv site workers): WebSocket clients use /app/*, the HTTP API /apps/*
+    location ^~ /app/ {
+        proxy_pass http://127.0.0.1:__PORT__;
+        include snippets/srv-proxy.conf;
+        proxy_set_header Host $host;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    location ^~ /apps/ {
+        proxy_pass http://127.0.0.1:__PORT__;
+        include snippets/srv-proxy.conf;
+        proxy_set_header Host $host;
+        proxy_set_header Connection "";
+    }
+EOF
+)
+    printf '%s\n' "${tpl//__PORT__/$(site_get "$d" REVERB_PORT)}"
+  fi
 }
 
 site_render_nginx() {
-  local d=$1 aliases type user ssl root names v6=0 nv h2_listen=" http2" h2_on=0
-  aliases=$(site_get "$d" ALIASES); type=$(site_get "$d" TYPE)
-  user=$(site_get "$d" SITE_USER); ssl=$(site_get "$d" SSL no)
-  root=$(site_docroot "$d"); names="$d${aliases:+ $aliases}"
+  local d=$1 aliases ssl names v6=0 nv h2_listen=" http2" h2_on=0
+  aliases=$(site_get "$d" ALIASES); ssl=$(site_get "$d" SSL no)
+  names="$d${aliases:+ $aliases}"
   if [[ -f /proc/net/if_inet6 ]]; then v6=1; fi
   if [[ $ssl == yes && ! -f /etc/letsencrypt/live/$d/fullchain.pem ]]; then
     warn "SSL is on for $d but no certificate was found — serving HTTP only"; ssl=no
@@ -1408,13 +1987,14 @@ site_render_nginx() {
     echo "    ssl_certificate_key /etc/letsencrypt/live/$d/privkey.pem;"
     echo "    include snippets/srv-ssl.conf;"
   fi
-  site_nginx_body "$d" "$type" "$root" "$user"
+  site_nginx_body "$d"
   echo "}"
 }
 
 # Write + enable the vhost, test it, reload; roll back if Nginx rejects it.
 site_apply_nginx() {
   local d=$1 avail="/etc/nginx/sites-available/$1.conf" enabled="/etc/nginx/sites-enabled/$1.conf" bak="" out
+  nginx_sync_shared
   if [[ -f $avail ]]; then bak="$TMP_DIR/$d.nginx.bak"; cp -a "$avail" "$bak"; fi
   install -d -m 755 "$NGINX_CUSTOM/$d"
   site_render_nginx "$d" >"$avail"
@@ -1461,35 +2041,227 @@ EOF
 }
 
 site_create_db() {
-  local d=$1 base name user pass i=2
+  local d=$1 eng=$2 base name user pass i=2
   base=${d//[^a-z0-9]/_}; base=${base:0:48}
   name=$base
-  while db_exists "$name"; do name="${base}_$i"; i=$(( i + 1 )); done
+  while eng_exists "$eng" "$name"; do name="${base}_$i"; i=$(( i + 1 )); done
   user=${name:0:32}; i=2
-  while db_user_exists "$user"; do user="${name:0:28}_$i"; i=$(( i + 1 )); done
+  while eng_user_exists "$eng" "$user"; do user="${name:0:28}_$i"; i=$(( i + 1 )); done
   pass=$(gen_password 24)
-  db_create "$name" "$user" "$pass" || return 1
-  site_set "$d" DB_NAME "$name"; site_set "$d" DB_USER "$user"; site_set "$d" DB_PASS "$pass"
+  eng_create "$eng" "$name" "$user" "$pass" || return 1
+  site_set "$d" DB_ENGINE "$eng"; site_set "$d" DB_NAME "$name"; site_set "$d" DB_USER "$user"; site_set "$d" DB_PASS "$pass"
+}
+
+redis_db_alloc() {   # a separate Redis database number (1–15) for each Node/Python app
+  local used i
+  used=" $(grep -hsE '^REDIS_DB=' "$SRV_SITES"/*.conf | cut -d= -f2 | tr '\n' ' ') "
+  for (( i = 1; i <= 15; i++ )); do
+    if [[ $used != *" $i "* ]]; then printf '%s' "$i"; return 0; fi
+  done
+  printf '0'
+}
+
+# ── .env helpers ─────────────────────────────────────────────────────────────
+env_get() { { grep -E "^${2}=" "$1" 2>/dev/null || true; } | tail -n 1 | cut -d= -f2-; }
+env_set() {
+  local file=$1 key=$2 val=$3 tmp
+  tmp=$(mktemp)
+  if grep -qE "^#?[[:space:]]*${key}=" "$file"; then
+    awk -v k="$key" -v v="$val" '!done && $0 ~ "^#?[[:space:]]*" k "=" { print k "=" v; done=1; next } { print }' "$file" >"$tmp"
+  else
+    cp "$file" "$tmp"
+    if [[ -s $tmp && -n $(tail -c 1 "$tmp") ]]; then echo >>"$tmp"; fi
+    printf '%s=%s\n' "$key" "$val" >>"$tmp"
+  fi
+  cat "$tmp" >"$file"; rm -f "$tmp"
+}
+env_unset() { if [[ -f $1 ]]; then sed -i "/^${2}=/d" "$1"; fi; }
+
+# app.env for Node/Python apps: DATABASE_URL, DB_*, REDIS_URL (loaded by the launcher)
+app_env_sync() {
+  local d=$1 user home f dbn eng scheme port
+  user=$(site_get "$d" SITE_USER); home=$(site_get "$d" HOME_DIR); f="$home/app.env"
+  if [[ ! -f $f ]]; then
+    printf '# Environment for %s — loaded when the app starts (KEY=value, shell syntax).\n# srv manages the DATABASE_*, DB_* and REDIS_URL lines.\n' "$d" >"$f"
+  fi
+  dbn=$(site_get "$d" DB_NAME)
+  if [[ -n $dbn ]]; then
+    eng=$(site_get "$d" DB_ENGINE mysql); port=$(eng_port "$eng")
+    scheme=mysql; if [[ $eng == pgsql ]]; then scheme=postgresql; fi
+    env_set "$f" DATABASE_URL "$scheme://$(site_get "$d" DB_USER):$(site_get "$d" DB_PASS)@127.0.0.1:$port/$dbn"
+    env_set "$f" DB_HOST 127.0.0.1
+    env_set "$f" DB_PORT "$port"
+    env_set "$f" DB_NAME "$dbn"
+    env_set "$f" DB_USER "$(site_get "$d" DB_USER)"
+    env_set "$f" DB_PASSWORD "$(site_get "$d" DB_PASS)"
+  fi
+  if [[ $(site_get "$d" REDIS) == yes ]]; then
+    env_set "$f" REDIS_URL "redis://:$(cfg_get REDIS_PASSWORD)@127.0.0.1:6379/$(site_get "$d" REDIS_DB 0)"
+  else
+    env_unset "$f" REDIS_URL
+  fi
+  chown "$user:$user" "$f"; chmod 600 "$f"
+}
+
+# ── site add: type-specific questions ────────────────────────────────────────
+site_ask_node() {
+  ensure_feature node
+  local -a vers=(); mapfile -t vers < <(node_versions)
+  (( ${#vers[@]} )) || die "No Node.js version found — run: srv install node"
+  if [[ -n $S_NODE ]]; then
+    in_list "$S_NODE" "${vers[@]}" || die "Node $S_NODE isn't installed (installed: ${vers[*]}). Run: srv install node $S_NODE"
+  elif (( ${#vers[@]} == 1 )); then
+    S_NODE=${vers[0]}
+  else
+    local -a items=(); local v def; def=$(cfg_get NODE_DEFAULT "${vers[-1]}")
+    if in_list "$def" "${vers[@]}"; then items+=("$def" "Node.js $(node_full "$def") (default)"); fi
+    for v in "${vers[@]}"; do if [[ $v != "$def" ]]; then items+=("$v" "Node.js $(node_full "$v")"); fi; done
+    S_NODE=$(ui_menu "Node.js version" "Node.js version for this app:" "${items[@]}") || die "Cancelled."
+  fi
+  if [[ -z $S_PRESET ]]; then
+    S_PRESET=$(ui_menu "Node.js app" "What kind of app is it?" \
+      next    "Next.js" \
+      nuxt    "Nuxt" \
+      nest    "NestJS" \
+      generic "Express / Fastify / other (npm start)") || die "Cancelled."
+  fi
+  local def_start def_build
+  case $S_PRESET in
+    next)    def_start="npm start";                    def_build="npm run build" ;;
+    nuxt)    def_start="node .output/server/index.mjs"; def_build="npm run build" ;;
+    nest)    def_start="node dist/main";               def_build="npm run build" ;;
+    generic) def_start="npm start";                    def_build="" ;;
+    *) die "Unknown preset: $S_PRESET (use next, nuxt, nest or generic)" ;;
+  esac
+  if (( ! S_START_SET )); then
+    S_START=$(ui_input "Start command — one command; your app must listen on \$PORT" "$def_start") || die "Cancelled."
+  fi
+  if (( ! S_BUILD_SET )); then
+    S_BUILD=$(ui_input "Build command (blank = no build step)" "$def_build" empty) || die "Cancelled."
+  fi
+  [[ -n $S_START && $S_START != *$'\n'* && $S_BUILD != *$'\n'* ]] || die "A one-line start command is required."
+}
+
+site_ask_python() {
+  ensure_feature python
+  if [[ -z $S_FRAMEWORK ]]; then
+    S_FRAMEWORK=$(ui_menu "Python app" "Framework:" \
+      django  "Django" \
+      flask   "Flask" \
+      fastapi "FastAPI" \
+      other   "Other WSGI / ASGI app") || die "Cancelled."
+  fi
+  local def_srv=gunicorn def_mod="app:app"
+  case $S_FRAMEWORK in
+    django)  def_mod="" ;;
+    flask)   def_mod="app:app" ;;
+    fastapi) def_srv=uvicorn; def_mod="main:app" ;;
+    other)   def_mod="app:app" ;;
+    *) die "Unknown framework: $S_FRAMEWORK (use django, flask, fastapi or other)" ;;
+  esac
+  if [[ -z $S_SERVER ]]; then
+    if [[ $def_srv == uvicorn ]]; then
+      S_SERVER=$(ui_menu "App server" "Run the app with:" uvicorn "uvicorn — ASGI (FastAPI, async)" gunicorn "gunicorn — WSGI") || die "Cancelled."
+    else
+      S_SERVER=$(ui_menu "App server" "Run the app with:" gunicorn "gunicorn — WSGI (Django, Flask)" uvicorn "uvicorn — ASGI (async Django, Starlette)") || die "Cancelled."
+    fi
+  fi
+  in_list "$S_SERVER" gunicorn uvicorn || die "Unknown app server: $S_SERVER (use gunicorn or uvicorn)"
+  if (( ! S_MODULE_SET )); then
+    if [[ $S_FRAMEWORK == django ]]; then
+      S_MODULE=$(ui_input "App module (blank = find <project>.wsgi automatically)" "" empty) || die "Cancelled."
+    else
+      S_MODULE=$(ui_input "App module (module:variable)" "$def_mod") || die "Cancelled."
+    fi
+  fi
+  if [[ -n $S_MODULE && ! $S_MODULE =~ ^[A-Za-z0-9_.]+:[A-Za-z0-9_.()]+$ ]]; then die "Invalid app module: $S_MODULE (e.g. main:app)"; fi
+  if [[ -z $S_MODULE && $S_FRAMEWORK != django ]]; then die "An app module is required (e.g. main:app)."; fi
+  if [[ -z $S_WORKERS ]]; then
+    local c; c=$(nproc 2>/dev/null || echo 1)
+    S_WORKERS=$(( c * 2 + 1 )); if (( S_WORKERS > 9 )); then S_WORKERS=9; fi
+  fi
+  [[ $S_WORKERS =~ ^[0-9]+$ ]] && (( S_WORKERS >= 1 && S_WORKERS <= 64 )) || die "Workers must be between 1 and 64."
+}
+
+site_ask_proxy() {
+  local domain=$1 u=$S_UPSTREAM n
+  while true; do
+    if [[ -z $u ]]; then u=$(ui_input "Forward requests to (host:port or URL, e.g. 127.0.0.1:8080)" "127.0.0.1:8080") || die "Cancelled."; fi
+    if n=$(normalize_upstream "$u"); then break; fi
+    warn "Invalid upstream: $u (use host:port, http://host:port or https://host:port)"
+    retry_or_die "Invalid upstream: $u"; u=""
+  done
+  S_UPSTREAM=$n
+  if [[ -z $S_PRESERVE ]]; then
+    local hdef=yes
+    if [[ $n =~ ^https?://(127\.0\.0\.1|localhost|\[::1\])(:|$) ]]; then hdef=local
+    elif [[ ! $n =~ ^https?://[0-9.]+(:|$) ]]; then hdef=no; fi   # a hostname: usually another website
+    if [[ $hdef == local ]]; then S_PRESERVE=yes
+    elif ui_yesno "Pass the visitor's Host header ($domain) to the upstream? Choose No if the upstream is another website." "$hdef"; then S_PRESERVE=yes
+    else S_PRESERVE=no; fi
+  fi
+}
+
+site_ask_pm() {
+  if [[ -z $S_PM ]]; then
+    local p2="PM2" sv="Supervisor"
+    feat_has pm2 || p2="PM2 (will be installed)"
+    feat_has supervisor || sv="Supervisor (will be installed)"
+    S_PM=$(ui_menu "Process manager" "Keep the app running with:" \
+      systemd    "systemd (recommended — built in, no extra daemon)" \
+      pm2        "$p2" \
+      supervisor "$sv") || die "Cancelled."
+  fi
+  in_list "$S_PM" systemd pm2 supervisor || die "Unknown process manager: $S_PM (use systemd, pm2 or supervisor)"
+  case $S_PM in
+    pm2)        ensure_feature node; ensure_feature pm2 ;;
+    supervisor) ensure_feature supervisor ;;
+  esac
 }
 
 # ── site add ─────────────────────────────────────────────────────────────────
 site_add() {
-  local domain="" aliases="" aliases_set=0 type="" php="" webroot="" webroot_set=0 want_db="" want_ssl=""
+  local domain="" aliases="" aliases_set=0 type="" php="" webroot="" webroot_set=0
+  local want_db="" want_ssl="" want_redis="" engine="" want_workers=no
+  S_NODE="" S_PRESET="" S_START="" S_START_SET=0 S_BUILD="" S_BUILD_SET=0 S_PM="" S_PORT=""
+  S_FRAMEWORK="" S_SERVER="" S_MODULE="" S_MODULE_SET=0 S_WORKERS="" S_UPSTREAM="" S_WS="" S_PRESERVE=""
   while (( $# )); do
     case $1 in
-      --domain)  need_val "$@"; domain=$2; shift 2 ;;
-      --aliases) need_val "$@"; aliases=$2; aliases_set=1; shift 2 ;;
-      --type)    need_val "$@"; type=$2; shift 2 ;;
-      --php)     need_val "$@"; php=$2; shift 2 ;;
-      --webroot) need_val "$@"; webroot=$2; webroot_set=1; shift 2 ;;
-      --db)      want_db=yes; shift ;;
-      --no-db)   want_db=no; shift ;;
-      --ssl)     want_ssl=yes; shift ;;
-      --no-ssl)  want_ssl=no; shift ;;
-      -*)        die "Unknown option: $1" ;;
-      *)         domain=$1; shift ;;
+      --domain)       need_val "$@"; domain=$2; shift 2 ;;
+      --aliases)      need_val "$@"; aliases=$2; aliases_set=1; shift 2 ;;
+      --type)         need_val "$@"; type=$2; shift 2 ;;
+      --php)          need_val "$@"; php=$2; shift 2 ;;
+      --webroot)      need_val "$@"; webroot=$2; webroot_set=1; shift 2 ;;
+      --node)         need_val "$@"; S_NODE=$2; shift 2 ;;
+      --preset)       need_val "$@"; S_PRESET=$2; shift 2 ;;
+      --start)        need_val "$@"; S_START=$2; S_START_SET=1; shift 2 ;;
+      --build)        need_val "$@"; S_BUILD=$2; S_BUILD_SET=1; shift 2 ;;
+      --pm)           need_val "$@"; S_PM=$2; shift 2 ;;
+      --port)         need_val "$@"; S_PORT=$2; shift 2 ;;
+      --framework)    need_val "$@"; S_FRAMEWORK=$2; shift 2 ;;
+      --server)       need_val "$@"; S_SERVER=$2; shift 2 ;;
+      --module)       need_val "$@"; S_MODULE=$2; S_MODULE_SET=1; shift 2 ;;
+      --workers)      need_val "$@"; S_WORKERS=$2; shift 2 ;;
+      --upstream)     need_val "$@"; S_UPSTREAM=$2; shift 2 ;;
+      --websocket)    S_WS=yes; shift ;;
+      --no-websocket) S_WS=no; shift ;;
+      --db)           want_db=yes; shift ;;
+      --no-db)        want_db=no; shift ;;
+      --engine)       need_val "$@"; engine=$2; shift 2 ;;
+      --pg|--pgsql|--postgres) engine=pgsql; shift ;;
+      --mysql|--mariadb)       engine=mysql; shift ;;
+      --redis)        want_redis=yes; shift ;;
+      --no-redis)     want_redis=no; shift ;;
+      --ssl)          want_ssl=yes; shift ;;
+      --no-ssl)       want_ssl=no; shift ;;
+      -*)             die "Unknown option: $1" ;;
+      *)              domain=$1; shift ;;
     esac
   done
+  if [[ -n $engine ]]; then
+    engine=$(norm_engine "$engine") || die "Unknown database engine (use mysql or pgsql)"
+    if [[ -z $want_db ]]; then want_db=yes; fi
+  fi
 
   ensure_feature nginx
 
@@ -1526,12 +2298,15 @@ site_add() {
       static  "Static HTML site" \
       spa     "Single-page app (React/Vue/Angular build)" \
       php     "Generic PHP (WordPress, custom PHP …)" \
-      laravel "Laravel application") || die "Cancelled."
+      laravel "Laravel application" \
+      node    "Node.js app (Next.js, Nuxt, NestJS, Express …)" \
+      python  "Python app (Django, Flask, FastAPI …)" \
+      proxy   "Reverse proxy to another server / port / container") || die "Cancelled."
   fi
-  case $type in static|spa|php|laravel) ;; *) die "Unknown type: $type (use static, spa, php or laravel)" ;; esac
+  case $type in static|spa|php|laravel|node|python|proxy) ;; *) die "Unknown type: $type (use static, spa, php, laravel, node, python or proxy)" ;; esac
 
   # PHP version
-  if [[ $type == php || $type == laravel ]]; then
+  if is_php_type "$type"; then
     ensure_feature php
     local -a vers=(); mapfile -t vers < <(php_versions)
     (( ${#vers[@]} )) || die "No PHP-FPM version found — run: srv install php"
@@ -1549,24 +2324,72 @@ site_add() {
     php=""
   fi
 
-  # Web root
-  if (( ! webroot_set )); then
-    local def_wr=""
-    if [[ $type == laravel ]]; then def_wr=public; fi
-    webroot=$(ui_input "Web root inside the app folder (blank = app folder itself; e.g. public, dist, build)" "$def_wr" empty) || die "Cancelled."
+  # Type-specific questions
+  case $type in
+    node)   site_ask_node ;;
+    python) site_ask_python ;;
+    proxy)  site_ask_proxy "$domain" ;;
+  esac
+
+  # Web root (sites Nginx serves files for)
+  if ! is_proxy_type "$type"; then
+    if (( ! webroot_set )); then
+      local def_wr=""
+      if [[ $type == laravel ]]; then def_wr=public; fi
+      webroot=$(ui_input "Web root inside the app folder (blank = app folder itself; e.g. public, dist, build)" "$def_wr" empty) || die "Cancelled."
+    fi
+    webroot=${webroot#/}; webroot=${webroot%/}
+    valid_relpath "$webroot" || die "Invalid web root: $webroot"
+  else
+    webroot=""
   fi
-  webroot=${webroot#/}; webroot=${webroot%/}
-  if [[ $webroot == *..* || ! $webroot =~ ^[A-Za-z0-9._/-]*$ ]]; then die "Invalid web root: $webroot"; fi
+
+  # WebSockets, process manager, port
+  if is_proxy_type "$type" && [[ -z $S_WS ]]; then
+    local wsdef=yes
+    if [[ $type == python && $S_FRAMEWORK != fastapi ]]; then wsdef=no; fi
+    if ui_yesno "Enable WebSocket support (socket.io, live updates, Channels …)?" "$wsdef"; then S_WS=yes; else S_WS=no; fi
+  fi
+  if is_app_type "$type"; then
+    site_ask_pm
+    if [[ -n $S_PORT ]]; then
+      valid_port "$S_PORT" || die "Port must be between 1024 and 65535."
+      if port_used_by_site "$S_PORT"; then die "Port $S_PORT is already assigned to another site."; fi
+      if port_in_use "$S_PORT"; then warn "Something is already listening on port $S_PORT."; fi
+    else
+      S_PORT=$(port_alloc) || die "No free port found."
+    fi
+  fi
 
   # Database
-  if [[ $type == php || $type == laravel ]]; then
+  if is_php_type "$type" || is_app_type "$type"; then
     if [[ -z $want_db ]]; then
       local dbdef=no; if [[ $type == laravel ]]; then dbdef=yes; fi
-      if ui_yesno "Create a MySQL/MariaDB database for $domain?" "$dbdef"; then want_db=yes; else want_db=no; fi
+      if ui_yesno "Create a database for $domain?" "$dbdef"; then want_db=yes; else want_db=no; fi
     fi
-    if [[ $want_db == yes ]]; then ensure_feature database; fi
+    if [[ $want_db == yes ]]; then db_pick_engine "$engine" install; engine=$DB_ENG; fi
   else
     want_db=no
+  fi
+
+  # Redis
+  if is_php_type "$type" || is_app_type "$type"; then
+    if [[ -z $want_redis ]]; then
+      if feat_has redis; then
+        local rdef=no; if [[ $type == laravel ]]; then rdef=yes; fi
+        if ui_yesno "Use Redis for $domain (cache, sessions, queues)?" "$rdef"; then want_redis=yes; else want_redis=no; fi
+      else
+        want_redis=no
+      fi
+    fi
+    if [[ $want_redis == yes ]]; then ensure_feature redis; fi
+  else
+    want_redis=no
+  fi
+
+  # Laravel queue workers / Horizon / Reverb
+  if [[ $type == laravel ]] && (( INTERACTIVE && ! ASSUME_YES )); then
+    if ui_yesno "Set up queue workers, Horizon or Reverb now? (runs under Supervisor)" no; then want_workers=yes; fi
   fi
 
   # SSL
@@ -1580,9 +2403,17 @@ site_add() {
   local user home app docroot
   user=$(site_user_for "$domain"); home="$WEB_ROOT/$domain"; app="$home/app"; docroot="$app${webroot:+/$webroot}"
   if (( INTERACTIVE && ! ASSUME_YES )); then
-    local summary
-    summary=$(printf 'Domain:      %s\nAliases:     %s\nType:        %s\nPHP:         %s\nWeb root:    %s\nLinux user:  %s\nDatabase:    %s\nHTTPS:       %s' \
-      "$domain" "${aliases:-none}" "$type" "${php:-n/a}" "$docroot" "$user" "$want_db" "$want_ssl")
+    local summary detail=""
+    case $type in
+      php|laravel) detail=$(printf 'PHP:         %s\nWeb root:    %s' "$php" "$docroot") ;;
+      static|spa)  detail=$(printf 'Web root:    %s' "$docroot") ;;
+      node)        detail=$(printf 'Node.js:     %s\nStart:       %s\nBuild:       %s\nPort:        %s\nManager:     %s' "$S_NODE" "$S_START" "${S_BUILD:-none}" "$S_PORT" "$S_PM") ;;
+      python)      detail=$(printf 'Framework:   %s (%s, %s workers)\nModule:      %s\nPort:        %s\nManager:     %s' "$S_FRAMEWORK" "$S_SERVER" "$S_WORKERS" "${S_MODULE:-auto-detect}" "$S_PORT" "$S_PM") ;;
+      proxy)       detail=$(printf 'Upstream:    %s' "$S_UPSTREAM") ;;
+    esac
+    summary=$(printf 'Domain:      %s\nAliases:     %s\nType:        %s\n%s\nLinux user:  %s\nDatabase:    %s\nRedis:       %s\nHTTPS:       %s' \
+      "$domain" "${aliases:-none}" "$type" "$detail" "$user" \
+      "$([[ $want_db == yes ]] && eng_label "$engine" || echo no)" "$want_redis" "$want_ssl")
     ui_yesno "Create this site?"$'\n\n'"$summary" yes || die "Cancelled."
   fi
 
@@ -1593,79 +2424,124 @@ site_add() {
     run useradd --home-dir "$home" --no-create-home --shell /bin/bash --user-group "$user" || die "Could not create user $user"
   fi
   mkdir -p "$app" "$home/logs" "$home/tmp"
-  # Laravel: keep app/ empty so the project can be cloned straight into it
-  if [[ $type != laravel ]]; then
-    mkdir -p "$docroot"
-    if [[ -z $(ls -A "$docroot" 2>/dev/null) ]]; then site_placeholder "$docroot" "$type" "$domain"; fi
-  fi
+  # Laravel and apps: keep app/ empty so the project can be cloned straight into it
+  case $type in
+    static|spa|php)
+      mkdir -p "$docroot"
+      if [[ -z $(ls -A "$docroot" 2>/dev/null) ]]; then site_placeholder "$docroot" "$type" "$domain"; fi ;;
+  esac
   chown -R "$user:$user" "$home"
   chmod 750 "$home" "$app" "$home/logs"; chmod 700 "$home/tmp"
   run usermod -aG "$user" www-data   # Nginx may read (not write) the site's files
 
   {
-    echo "# srv site config — managed by srv"
+    echo "# srv site config — managed by srv (change settings with: srv site set $domain KEY value)"
     echo "DOMAIN=$domain"
     echo "ALIASES=$aliases"
     echo "TYPE=$type"
-    echo "PHP=$php"
     echo "SITE_USER=$user"
     echo "HOME_DIR=$home"
     echo "APP_DIR=$app"
-    echo "WEBROOT=$webroot"
     echo "SSL=no"
     echo "ENABLED=yes"
-    echo "DB_NAME="
-    echo "DB_USER="
-    echo "DB_PASS="
+    case $type in
+      static|spa) echo "WEBROOT=$webroot" ;;
+      php)        printf '%s\n' "PHP=$php" "WEBROOT=$webroot" ;;
+      laravel)    printf '%s\n' "PHP=$php" "WEBROOT=$webroot" "QUEUE_WORKERS=0" "HORIZON=no" "REVERB=no" ;;
+      node)       printf '%s\n' "NODE=$S_NODE" "PRESET=$S_PRESET" "START_CMD=$S_START" "BUILD_CMD=$S_BUILD" "INSTALL_CMD=" \
+                                "PORT=$S_PORT" "PM=$S_PM" "APP_ACTIVE=no" "WEBSOCKET=$S_WS" "TIMEOUT=60" ;;
+      python)     printf '%s\n' "PY_FRAMEWORK=$S_FRAMEWORK" "PY_SERVER=$S_SERVER" "PY_APP=$S_MODULE" "WORKERS=$S_WORKERS" "BUILD_CMD=" \
+                                "PORT=$S_PORT" "PM=$S_PM" "APP_ACTIVE=no" "WEBSOCKET=$S_WS" "TIMEOUT=60"
+                  if [[ $S_FRAMEWORK == django ]]; then printf '%s\n' "STATIC_DIR=staticfiles" "MEDIA_DIR=media"; fi ;;
+      proxy)      printf '%s\n' "UPSTREAM=$S_UPSTREAM" "PRESERVE_HOST=$S_PRESERVE" "WEBSOCKET=$S_WS" "TIMEOUT=60" ;;
+    esac
+    if is_php_type "$type" || is_app_type "$type"; then printf '%s\n' "DB_ENGINE=" "DB_NAME=" "DB_USER=" "DB_PASS=" "REDIS=no"; fi
     echo "CREATED=$(date '+%F %T')"
   } >"$(site_file "$domain")"
   chmod 600 "$(site_file "$domain")"
 
   site_render_pool "$domain" || die "PHP-FPM pool setup failed — see $SRV_LOG. Clean up with: srv site remove $domain"
+  if is_app_type "$type"; then app_render_launcher "$domain"; pm_write "$domain"; fi
   site_apply_nginx "$domain" || die "Nginx setup failed. Clean up with: srv site remove $domain"
   site_render_cron "$domain"
-  ok "Nginx${php:+ + PHP-FPM $php} configured"
+  ok "Nginx${php:+ + PHP-FPM $php}${S_PM:+ + $S_PM} configured"
 
   if [[ $want_db == yes ]]; then
-    if site_create_db "$domain"; then ok "Database $(site_get "$domain" DB_NAME) created"
+    if site_create_db "$domain" "$engine"; then ok "$(eng_label "$engine") database $(site_get "$domain" DB_NAME) created"
     else warn "Database creation failed — create one later with: srv db create"; fi
   fi
+  if [[ $want_redis == yes ]]; then
+    site_set "$domain" REDIS yes
+    if is_app_type "$type"; then site_set "$domain" REDIS_DB "$(redis_db_alloc)"; fi
+  fi
+  if is_app_type "$type"; then app_env_sync "$domain"; fi
   if [[ $want_ssl == yes ]]; then
     if ! ssl_issue "$domain" 0; then warn "HTTPS isn't enabled yet — fix DNS, then run: srv ssl add $domain"; fi
   fi
+  if [[ $want_workers == yes ]]; then try site_workers "$domain"; fi
   site_summary "$domain"
 }
 
 site_summary() {
-  local d=$1 scheme=http type user app php dbn
+  local d=$1 scheme=http type user app home php dbn
   if [[ $(site_get "$d" SSL) == yes ]]; then scheme=https; fi
   type=$(site_get "$d" TYPE); user=$(site_get "$d" SITE_USER); app=$(site_get "$d" APP_DIR)
-  php=$(site_get "$d" PHP); dbn=$(site_get "$d" DB_NAME)
+  home=$(site_get "$d" HOME_DIR); php=$(site_get "$d" PHP); dbn=$(site_get "$d" DB_NAME)
   echo; hr
   printf '%s%s %s is ready%s\n' "$C_G" "$C_BOLD" "$d" "$C_0"
   hr
-  printf '  %-13s %s\n' "URL" "$scheme://$d" "App folder" "$app" "Web root" "$(site_docroot "$d")" "Linux user" "$user"
+  printf '  %-13s %s\n' "URL" "$scheme://$d" "Type" "$type" "App folder" "$app" "Linux user" "$user"
+  case $type in
+    static|spa|php|laravel) printf '  %-13s %s\n' "Web root" "$(site_docroot "$d")" ;;
+  esac
   if [[ -n $php ]]; then printf '  %-13s %s\n' "PHP" "$php  (pool: /etc/php/$php/fpm/pool.d/srv-$user.conf)"; fi
+  case $type in
+    node)
+      printf '  %-13s %s\n' "Node.js" "$(site_get "$d" NODE) ($(node_full "$(site_get "$d" NODE)"))" \
+        "Start" "$(site_get "$d" START_CMD)" "Build" "$(b=$(site_get "$d" BUILD_CMD); echo "${b:-none}")" \
+        "Port" "127.0.0.1:$(site_get "$d" PORT)" "Manager" "$(site_get "$d" PM)" "Env file" "$home/app.env" ;;
+    python)
+      printf '  %-13s %s\n' "Framework" "$(site_get "$d" PY_FRAMEWORK) — $(site_get "$d" PY_SERVER), $(site_get "$d" WORKERS) workers" \
+        "Module" "$(m=$(site_get "$d" PY_APP); echo "${m:-auto-detect <project>.wsgi}")" "Virtualenv" "$home/venv" \
+        "Port" "127.0.0.1:$(site_get "$d" PORT)" "Manager" "$(site_get "$d" PM)" "Env file" "$home/app.env" ;;
+    proxy)
+      printf '  %-13s %s\n' "Upstream" "$(site_get "$d" UPSTREAM)" ;;
+  esac
   printf '  %-13s %s\n' "Nginx" "/etc/nginx/sites-available/$d.conf" "Custom conf" "$NGINX_CUSTOM/$d/*.conf"
   if [[ -n $dbn ]]; then
-    printf '  %-13s %s\n' "DB name" "$dbn" "DB user" "$(site_get "$d" DB_USER)" "DB password" "$(site_get "$d" DB_PASS)" "DB host" "127.0.0.1:3306"
+    local eng; eng=$(site_get "$d" DB_ENGINE mysql)
+    printf '  %-13s %s\n' "Database" "$(eng_label "$eng")" "DB name" "$dbn" "DB user" "$(site_get "$d" DB_USER)" \
+      "DB password" "$(site_get "$d" DB_PASS)" "DB host" "127.0.0.1:$(eng_port "$eng")"
   fi
+  if [[ $(site_get "$d" REDIS) == yes ]]; then printf '  %-13s %s\n' "Redis" "127.0.0.1:6379$( is_app_type "$type" && echo " (database $(site_get "$d" REDIS_DB 0))")"; fi
   echo
   echo " Next steps"
-  echo "   1. Upload your project into $app   (git clone, rsync, SFTP …)"
-  echo "   2. srv site fix-perms $d"
-  if [[ $type == laravel ]]; then
-    echo "   3. runuser -u $user -- env -C $app composer install --no-dev --optimize-autoloader"
-    echo "   4. srv site apply-env $d      # APP_URL + DB credentials → .env (+ APP_KEY)"
-    echo "   5. runuser -u $user -- env -C $app php$php artisan migrate --force"
-  fi
+  case $type in
+    static|spa|php)
+      echo "   1. Upload your files into $(site_docroot "$d")   (git clone, rsync, SFTP …)"
+      echo "   2. srv site fix-perms $d" ;;
+    laravel)
+      echo "   1. Upload your project into $app   (git clone, rsync, SFTP …)"
+      echo "   2. srv site fix-perms $d"
+      echo "   3. runuser -u $user -- env -C $app composer install --no-dev --optimize-autoloader"
+      echo "   4. srv site apply-env $d      # APP_URL, DB, Redis, Reverb → .env (+ APP_KEY)"
+      echo "   5. runuser -u $user -- env -C $app php$php artisan migrate --force"
+      echo "   •  Queue workers / Horizon / Reverb:  srv site workers $d" ;;
+    node|python)
+      echo "   1. Upload your project into $app   (git clone, rsync, SFTP …)"
+      echo "   2. Put your environment variables in $home/app.env"
+      echo "   3. srv app build $d       # installs dependencies, builds and starts the app"
+      echo "   4. srv app logs $d" ;;
+    proxy)
+      echo "   •  Requests to $d are forwarded to $(site_get "$d" UPSTREAM)" ;;
+  esac
   if [[ $scheme == http ]]; then echo "   •  Enable HTTPS once DNS points here:  srv ssl add $d"; fi
 }
 
 # ── Other site commands ──────────────────────────────────────────────────────
 site_list() {
-  local d any=0 ssl days
-  printf '%s%-34s %-8s %-5s %-10s %-9s %s%s\n' "$C_BOLD" DOMAIN TYPE PHP SSL STATUS DATABASE "$C_0"
+  local d any=0 ssl days dbn
+  printf '%s%-34s %-8s %-9s %-6s %-9s %s%s\n' "$C_BOLD" DOMAIN TYPE RUNTIME SSL STATUS DATABASE "$C_0"
   while IFS= read -r d; do
     [[ -n $d ]] || continue
     any=1
@@ -1673,8 +2549,10 @@ site_list() {
     if [[ $(site_get "$d" SSL) == yes ]]; then
       if days=$(cert_days_left "$d"); then ssl="${days}d"; else ssl=yes; fi
     fi
-    printf '%-34s %-8s %-5s %-10s %-9s %s\n' "$d" "$(site_get "$d" TYPE)" "$(site_get "$d" PHP)" "$ssl" \
-      "$([[ $(site_get "$d" ENABLED yes) == yes ]] && echo enabled || echo disabled)" "$(site_get "$d" DB_NAME)"
+    dbn=$(site_get "$d" DB_NAME)
+    if [[ -n $dbn && $(site_get "$d" DB_ENGINE) == pgsql ]]; then dbn="$dbn (pg)"; fi
+    printf '%-34s %-8s %-9s %-6s %-9s %s\n' "$d" "$(site_get "$d" TYPE)" "$(site_runtime "$d")" "$ssl" \
+      "$([[ $(site_get "$d" ENABLED yes) == yes ]] && echo enabled || echo disabled)" "$dbn"
   done < <(site_list_domains)
   if (( ! any )); then echo "  (no sites yet — create one with: srv site add)"; fi
 }
@@ -1688,13 +2566,16 @@ site_info() {
     if [[ -z $line || $line == \#* ]]; then continue; fi
     k=${line%%=*}
     if [[ $k == DB_PASS && -n ${line#*=} && $secrets -eq 0 ]]; then line="DB_PASS=******** (show with --secrets)"; fi
-    printf '  %-10s %s\n' "$k" "${line#*=}"
+    printf '  %-14s %s\n' "$k" "${line#*=}"
   done <"$(site_file "$d")"
   hr
-  printf '  %-10s %s\n' "Nginx" "/etc/nginx/sites-available/$d.conf" "Custom" "$NGINX_CUSTOM/$d/*.conf" \
+  printf '  %-14s %s\n' "Nginx" "/etc/nginx/sites-available/$d.conf" "Custom" "$NGINX_CUSTOM/$d/*.conf" \
     "Logs" "/var/log/nginx/$d.{access,error}.log, $(site_get "$d" HOME_DIR)/logs/"
+  if is_app_type "$(site_get "$d" TYPE)"; then
+    printf '  %-14s %s\n' "Launcher" "$SRV_RUN/$d.sh" "Env file" "$(site_get "$d" HOME_DIR)/app.env" "State" "$(pm_state "$d")"
+  fi
   local days
-  if days=$(cert_days_left "$d"); then printf '  %-10s %s\n' "Cert" "expires in $days days"; fi
+  if days=$(cert_days_left "$d"); then printf '  %-14s %s\n' "Cert" "expires in $days days"; fi
 }
 
 site_enable() {
@@ -1709,7 +2590,7 @@ site_disable() {
   site_set "$d" ENABLED no
   rm -f "/etc/nginx/sites-enabled/$d.conf"
   nginx_reload || die "Nginx reload failed"
-  ok "$d disabled (files, database and config are kept)"
+  ok "$d disabled (files, database, app process and config are kept)"
 }
 
 site_rebuild() {
@@ -1723,10 +2604,64 @@ site_rebuild() {
   fi
   for d in "${list[@]}"; do
     info "Rebuilding $d"
-    if site_render_pool "$d" && site_apply_nginx "$d"; then site_render_cron "$d"; ok "$d rebuilt"
-    else err "$d failed"; failed=1; fi
+    if site_render_pool "$d" && site_apply_nginx "$d"; then
+      site_render_cron "$d"
+      try site_render_processes "$d"
+      if (( TRY_RC == 0 )); then ok "$d rebuilt"; else err "$d: process config failed"; failed=1; fi
+    else
+      err "$d failed"; failed=1
+    fi
   done
   if (( failed )); then return 1; fi
+}
+
+# Re-render launcher + process-manager config (restart if running) and Laravel workers
+site_render_processes() {
+  local d=$1 type; type=$(site_get "$d" TYPE)
+  if is_app_type "$type"; then
+    app_render_launcher "$d"
+    pm_write "$d"
+    if [[ $(site_get "$d" APP_ACTIVE) == yes ]]; then pm_start "$d" && { app_wait "$d" || true; }; fi
+  elif [[ $type == laravel ]] && { [[ -f $(laravel_conf "$d") ]] || (( $(site_get "$d" QUEUE_WORKERS 0) > 0 )); }; then
+    laravel_render_workers "$d"
+  fi
+}
+
+site_set_cmd() {
+  local d=${1:-} k=${2:-} type allowed
+  local -a _vers=()
+  [[ -n $d && -n $k && $# -ge 3 ]] || die "Usage: srv site set <domain> <KEY> <value>   (see editable keys with: srv site set <domain> help x)"
+  local v=$3
+  d=$(resolve_domain "$d") || exit 1
+  type=$(site_get "$d" TYPE); k=${k^^}
+  case $type in
+    static|spa)  allowed="WEBROOT" ;;
+    php|laravel) allowed="WEBROOT PHP" ;;
+    node)        allowed="START_CMD BUILD_CMD INSTALL_CMD NODE PORT TIMEOUT WEBSOCKET MAX_BODY" ;;
+    python)      allowed="PY_APP PY_SERVER WORKERS BUILD_CMD PORT TIMEOUT WEBSOCKET MAX_BODY STATIC_DIR MEDIA_DIR" ;;
+    proxy)       allowed="UPSTREAM PRESERVE_HOST TIMEOUT WEBSOCKET MAX_BODY" ;;
+  esac
+  # shellcheck disable=SC2086
+  in_list "$k" $allowed || die "Editable keys for $type sites: $allowed"
+  [[ $v != *$'\n'* ]] || die "The value must be a single line."
+  case $k in
+    START_CMD)   [[ -n $v ]] || die "The start command can't be empty." ;;
+    PY_APP)      [[ -z $v || $v =~ ^[A-Za-z0-9_.]+:[A-Za-z0-9_.()]+$ ]] || die "Invalid module (e.g. main:app)" ;;
+    PY_SERVER)   in_list "$v" gunicorn uvicorn || die "Use gunicorn or uvicorn" ;;
+    WORKERS)     [[ $v =~ ^[0-9]+$ ]] && (( v >= 1 && v <= 64 )) || die "Workers must be 1–64" ;;
+    TIMEOUT)     [[ $v =~ ^[0-9]+$ ]] && (( v >= 1 && v <= 86400 )) || die "Timeout is in seconds (1–86400)" ;;
+    WEBSOCKET|PRESERVE_HOST) in_list "$v" yes no || die "Use yes or no" ;;
+    MAX_BODY)    [[ -z $v || $v =~ ^[0-9]+[kKmMgG]?$ ]] || die "Use a size like 100m" ;;
+    UPSTREAM)    v=$(normalize_upstream "$v") || die "Invalid upstream (host:port or http(s)://host:port)" ;;
+    WEBROOT|STATIC_DIR|MEDIA_DIR) v=${v#/}; v=${v%/}; valid_relpath "$v" || die "Invalid path" ;;
+    PHP)         mapfile -t _vers < <(php_versions); in_list "$v" "${_vers[@]}" || die "PHP $v isn't installed (installed: $(php_versions | tr '\n' ' '))" ;;
+    NODE)        mapfile -t _vers < <(node_versions); in_list "$v" "${_vers[@]}" || die "Node $v isn't installed (installed: $(node_versions | tr '\n' ' '))" ;;
+    PORT)        valid_port "$v" || die "Port must be 1024–65535"
+                 if [[ $v != "$(site_get "$d" PORT)" ]] && port_used_by_site "$v"; then die "Port $v is assigned to another site"; fi ;;
+  esac
+  site_set "$d" "$k" "$v"
+  ok "$d: $k=$v"
+  site_rebuild "$d"
 }
 
 site_fix_perms() {
@@ -1738,64 +2673,116 @@ site_fix_perms() {
   run chown -R "$user:$user" "$home"
   run chmod 750 "$home" "$app" "$home/logs"
   run chmod 700 "$home/tmp"
-  # Owner (PHP) read/write; group (Nginx) read-only; others nothing. Keeps exec bits.
+  # Owner read/write; group (Nginx) read-only; others nothing. Keeps exec bits.
   run chmod -R u+rwX,g+rX,g-w,o-rwx "$app"
-  if [[ -f $app/.env ]]; then run chmod 600 "$app/.env"; fi
+  local f
+  for f in "$app/.env" "$home/app.env"; do if [[ -f $f ]]; then run chmod 600 "$f"; fi; done
   ok "Owner $user (read/write), Nginx read-only, others no access"
 }
 
-env_set() {
-  local file=$1 key=$2 val=$3 tmp
-  tmp=$(mktemp)
-  if grep -qE "^#?[[:space:]]*${key}=" "$file"; then
-    awk -v k="$key" -v v="$val" '!done && $0 ~ "^#?[[:space:]]*" k "=" { print k "=" v; done=1; next } { print }' "$file" >"$tmp"
-  else
-    cp "$file" "$tmp"
-    if [[ -n $(tail -c 1 "$tmp") ]]; then echo >>"$tmp"; fi
-    printf '%s=%s\n' "$key" "$val" >>"$tmp"
-  fi
-  cat "$tmp" >"$file"; rm -f "$tmp"
-}
-
 site_apply_env() {
-  local d type user app php dbn scheme=http env
+  local d type user app php dbn scheme=http env eng port
   d=$(resolve_domain "${1:-}") || exit 1
   type=$(site_get "$d" TYPE); user=$(site_get "$d" SITE_USER); app=$(site_get "$d" APP_DIR)
   php=$(site_get "$d" PHP); dbn=$(site_get "$d" DB_NAME)
-  [[ $type == php || $type == laravel ]] || die "apply-env is for PHP/Laravel sites."
+  if is_app_type "$type"; then
+    app_env_sync "$d"
+    ok "$(site_get "$d" HOME_DIR)/app.env updated — restart to apply: srv app restart $d"
+    return 0
+  fi
+  is_php_type "$type" || die "apply-env is for PHP, Laravel, Node.js and Python sites."
   if [[ $(site_get "$d" SSL) == yes ]]; then scheme=https; fi
   env="$app/.env"
   if [[ ! -f $env ]]; then
     if [[ -f $app/.env.example ]]; then cp "$app/.env.example" "$env"; info "Created .env from .env.example"
     else die "No $env or .env.example found — upload your project first."; fi
   fi
+  local -a written=(APP_URL)
   env_set "$env" APP_URL "$scheme://$d"
   if [[ -n $dbn ]]; then
-    env_set "$env" DB_CONNECTION mysql
+    eng=$(site_get "$d" DB_ENGINE mysql); port=$(eng_port "$eng")
+    env_set "$env" DB_CONNECTION "$eng"
     env_set "$env" DB_HOST 127.0.0.1
-    env_set "$env" DB_PORT 3306
+    env_set "$env" DB_PORT "$port"
     env_set "$env" DB_DATABASE "$dbn"
     env_set "$env" DB_USERNAME "$(site_get "$d" DB_USER)"
     env_set "$env" DB_PASSWORD "$(site_get "$d" DB_PASS)"
-  else
-    warn "No database is linked to this site — only APP_URL was written."
+    written+=("DB_* ($eng)")
+  fi
+  if [[ $(site_get "$d" REDIS) == yes ]] && feat_has redis; then
+    env_set "$env" REDIS_CLIENT phpredis
+    env_set "$env" REDIS_HOST 127.0.0.1
+    env_set "$env" REDIS_PASSWORD "$(cfg_get REDIS_PASSWORD)"
+    env_set "$env" REDIS_PORT 6379
+    env_set "$env" REDIS_PREFIX "${user}_"           # keeps sites apart in the shared Redis
+    env_set "$env" CACHE_PREFIX "${user}_cache_"
+    env_set "$env" CACHE_STORE redis
+    if grep -qE '^CACHE_DRIVER=' "$env"; then env_set "$env" CACHE_DRIVER redis; fi
+    env_set "$env" SESSION_DRIVER redis
+    env_set "$env" QUEUE_CONNECTION redis
+    written+=("REDIS_* + cache/session/queue → redis")
+    if [[ $(site_get "$d" HORIZON) == yes ]]; then env_set "$env" HORIZON_PREFIX "${user}_horizon:"; fi
+  fi
+  if [[ $type == laravel && $(site_get "$d" REVERB) == yes ]]; then
+    env_set "$env" BROADCAST_CONNECTION reverb
+    if [[ -z $(env_get "$env" REVERB_APP_ID) ]];     then env_set "$env" REVERB_APP_ID "$(( (RANDOM << 15 | RANDOM) % 900000 + 100000 ))"; fi
+    if [[ -z $(env_get "$env" REVERB_APP_KEY) ]];    then env_set "$env" REVERB_APP_KEY "$(gen_password 20 | tr '[:upper:]' '[:lower:]')"; fi
+    if [[ -z $(env_get "$env" REVERB_APP_SECRET) ]]; then env_set "$env" REVERB_APP_SECRET "$(gen_password 20 | tr '[:upper:]' '[:lower:]')"; fi
+    env_set "$env" REVERB_SERVER_HOST 127.0.0.1
+    env_set "$env" REVERB_SERVER_PORT "$(site_get "$d" REVERB_PORT)"
+    env_set "$env" REVERB_HOST "$d"
+    env_set "$env" REVERB_PORT "$([[ $scheme == https ]] && echo 443 || echo 80)"
+    env_set "$env" REVERB_SCHEME "$scheme"
+    written+=("REVERB_*")
   fi
   chown "$user:$user" "$env"; chmod 600 "$env"
   if [[ $type == laravel && -f $app/artisan && -f $app/vendor/autoload.php ]] && ! grep -qE '^APP_KEY=.+' "$env"; then
     run runuser -u "$user" -- env -C "$app" "/usr/bin/php$php" artisan key:generate --force && ok "APP_KEY generated"
   fi
-  ok ".env updated for $d"
+  ok ".env updated for $d: ${written[*]}"
+  if [[ $type == laravel && -f $(laravel_conf "$d") ]]; then info "Restart workers to load it: srv app restart $d"; fi
+}
+
+site_redis() {
+  local d=${1:-} mode=${2:-} type
+  d=$(resolve_domain "$d") || exit 1
+  type=$(site_get "$d" TYPE)
+  is_php_type "$type" || is_app_type "$type" || die "Redis is for PHP, Laravel, Node.js and Python sites."
+  if [[ -z $mode ]]; then
+    if (( INTERACTIVE )); then
+      if ui_yesno "Use Redis for $d?" "$(site_get "$d" REDIS no)"; then mode=on; else mode=off; fi
+    else
+      echo "Redis for $d: $(site_get "$d" REDIS no)"; return 0
+    fi
+  fi
+  case $mode in
+    on|yes)
+      ensure_feature redis
+      site_set "$d" REDIS yes
+      if is_app_type "$type" && [[ -z $(site_get "$d" REDIS_DB) ]]; then site_set "$d" REDIS_DB "$(redis_db_alloc)"; fi
+      ok "Redis enabled for $d" ;;
+    off|no)
+      site_set "$d" REDIS no
+      ok "Redis disabled for $d" ;;
+    *) die "Usage: srv site redis <domain> on|off" ;;
+  esac
+  if is_app_type "$type"; then app_env_sync "$d"; info "REDIS_URL updated in app.env — restart to apply: srv app restart $d"
+  else info "Write it into .env with: srv site apply-env $d"; fi
 }
 
 site_logs() {
-  local d=${1:-} kind=${2:-error} f
+  local d=${1:-} kind=${2:-} f home
   d=$(resolve_domain "$d") || exit 1
+  home=$(site_get "$d" HOME_DIR)
+  if [[ -z $kind ]]; then if is_app_type "$(site_get "$d" TYPE)"; then kind=app; else kind=error; fi; fi
   case $kind in
-    error)       f=/var/log/nginx/$d.error.log ;;
-    access)      f=/var/log/nginx/$d.access.log ;;
-    php)         f=$(site_get "$d" HOME_DIR)/logs/php-error.log ;;
-    laravel|app) f=$(site_get "$d" APP_DIR)/storage/logs/laravel.log ;;
-    *) die "Log type must be one of: error, access, php, laravel" ;;
+    error)   f=/var/log/nginx/$d.error.log ;;
+    access)  f=/var/log/nginx/$d.access.log ;;
+    php)     f=$home/logs/php-error.log ;;
+    laravel) f=$(site_get "$d" APP_DIR)/storage/logs/laravel.log ;;
+    app)     f=$home/logs/app.log ;;
+    queue|horizon|reverb) f=$home/logs/$kind.log ;;
+    *) die "Log type must be one of: error, access, php, laravel, app, queue, horizon, reverb" ;;
   esac
   [[ -f $f ]] || die "No log yet: $f"
   if (( MENU_MODE )); then tail -n 100 "$f"; else exec tail -n 100 -f "$f"; fi
@@ -1805,9 +2792,9 @@ site_remove() {
   local d="" purge=0 a
   for a in "$@"; do case $a in --purge) purge=1 ;; *) d=$a ;; esac; done
   d=$(resolve_domain "$d") || exit 1
-  local user home php dbn dbu
-  user=$(site_get "$d" SITE_USER); home=$(site_get "$d" HOME_DIR); php=$(site_get "$d" PHP)
-  dbn=$(site_get "$d" DB_NAME); dbu=$(site_get "$d" DB_USER)
+  local user home dbn dbu eng type
+  user=$(site_get "$d" SITE_USER); home=$(site_get "$d" HOME_DIR); type=$(site_get "$d" TYPE)
+  dbn=$(site_get "$d" DB_NAME); dbu=$(site_get "$d" DB_USER); eng=$(site_get "$d" DB_ENGINE mysql)
 
   if (( INTERACTIVE && ! ASSUME_YES )); then
     local typed
@@ -1822,11 +2809,20 @@ site_remove() {
     del_files=yes; del_db=yes; del_cert=yes
   elif (( INTERACTIVE && ! ASSUME_YES )); then
     if ui_yesno "Delete the site's files in $home?" no; then del_files=yes; fi
-    if [[ -n $dbn ]] && ui_yesno "Drop database '$dbn' and user '$dbu'?" no; then del_db=yes; fi
+    if [[ -n $dbn ]] && ui_yesno "Drop $(eng_label "$eng") database '$dbn' and user '$dbu'?" no; then del_db=yes; fi
     if [[ -d /etc/letsencrypt/live/$d ]] && ui_yesno "Delete the SSL certificate?" yes; then del_cert=yes; fi
   fi
 
   step "Removing $d"
+  # Processes first, so nothing keeps running against removed config
+  if is_app_type "$type"; then pm_remove "$d" "$(site_get "$d" PM systemd)"; fi
+  local lconf; lconf=$(laravel_conf "$d")
+  if [[ -f $lconf ]]; then
+    supervisorctl stop "srv-$user-laravel:*" >>"$SRV_LOG" 2>&1 || true
+    rm -f "$lconf"; sv_update || true
+  fi
+  rm -f "$SRV_RUN/$d.sh" "$SRV_RUN/$d.pm2.config.js"
+
   rm -f "/etc/nginx/sites-enabled/$d.conf" "/etc/nginx/sites-available/$d.conf"
   rm -rf "${NGINX_CUSTOM:?}/$d"
   nginx_reload || warn "Nginx reload failed — check: nginx -t"
@@ -1839,8 +2835,10 @@ site_remove() {
   rm -f "/etc/cron.d/srv-$user"
 
   if [[ $del_db == yes && -n $dbn ]]; then
-    if printf 'DROP DATABASE IF EXISTS `%s`;\nDROP USER IF EXISTS '"'"'%s'"'"'@'"'"'localhost'"'"';\n' "$dbn" "$dbu" | db_run >>"$SRV_LOG" 2>&1
-    then ok "Database $dbn dropped"; else warn "Couldn't drop database $dbn"; fi
+    if eng_drop_db "$eng" "$dbn"; then
+      ok "Database $dbn dropped"
+      if [[ -n $dbu ]]; then eng_drop_user "$eng" "$dbu" || warn "Couldn't drop user $dbu"; fi
+    else warn "Couldn't drop database $dbn"; fi
   fi
   if [[ $del_cert == yes && -d /etc/letsencrypt/live/$d ]]; then
     run certbot delete --cert-name "$d" --non-interactive || warn "Couldn't delete the certificate"
@@ -1848,6 +2846,7 @@ site_remove() {
   if [[ $del_files == yes ]]; then
     if [[ $home == "$WEB_ROOT"/?* && $home != *..* && $home != "$ACME_ROOT" ]]; then
       pkill -u "$user" 2>/dev/null || true
+      sleep 1
       rm -rf "$home"
       rm -f "/var/log/nginx/$d."*.log*
       userdel "$user" >>"$SRV_LOG" 2>&1 || warn "Couldn't delete user $user"
@@ -1868,15 +2867,613 @@ cmd_site() {
     add|new)          site_add "$@" ;;
     list|ls)          site_list ;;
     info|show)        site_info "$@" ;;
+    set)              site_set_cmd "$@" ;;
     enable)           site_enable "${1:-}" ;;
     disable)          site_disable "${1:-}" ;;
     rebuild)          site_rebuild "${1:-}" ;;
     fix-perms|perms)  site_fix_perms "${1:-}" ;;
     apply-env|env)    site_apply_env "${1:-}" ;;
+    workers)          site_workers "$@" ;;
+    redis)            site_redis "$@" ;;
     logs|log)         site_logs "$@" ;;
     remove|rm|delete) site_remove "$@" ;;
     ""|menu)          menu_sites ;;
     *) die "Unknown site command: $sub (see: srv help)" ;;
+  esac
+}
+
+# =============================================================================
+#  APPS — Node.js / Python processes under systemd, PM2 or Supervisor
+#
+#  Each app has a launcher, /opt/srv/run/<domain>.sh, that sets PATH, PORT,
+#  HOST, loads <home>/app.env and execs the start command. All three process
+#  managers run that same launcher as the site's own Linux user, and write the
+#  output to <home>/logs/app.log.
+# =============================================================================
+app_pm()   { site_get "$1" PM systemd; }
+app_unit() { printf 'srv-%s' "$(site_get "$1" SITE_USER)"; }
+
+app_path() {
+  local d=$1 base=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  case $(site_get "$d" TYPE) in
+    node)   printf '%s/%s/bin:%s' "$NODE_ROOT" "$(site_get "$d" NODE)" "$base" ;;
+    python) printf '%s/venv/bin:%s' "$(site_get "$d" HOME_DIR)" "$base" ;;
+    *)      printf '%s' "$base" ;;
+  esac
+}
+
+py_detect_module() {   # Django: find <project>/wsgi.py next to manage.py
+  local app=$1 f
+  f=$(find "$app" -mindepth 2 -maxdepth 2 -name wsgi.py -print -quit 2>/dev/null) || true
+  [[ -n $f ]] || return 1
+  printf '%s.wsgi:application' "$(basename "$(dirname "$f")")"
+}
+
+app_command() {
+  local d=$1 port mod server w
+  port=$(site_get "$d" PORT)
+  if [[ $(site_get "$d" TYPE) == node ]]; then site_get "$d" START_CMD "npm start"; return 0; fi
+  server=$(site_get "$d" PY_SERVER gunicorn); w=$(site_get "$d" WORKERS 2); mod=$(site_get "$d" PY_APP)
+  if [[ -z $mod && $(site_get "$d" PY_FRAMEWORK) == django ]]; then
+    mod=$(py_detect_module "$(site_get "$d" APP_DIR)") || mod=""
+    if [[ -n $mod && $server == uvicorn ]]; then mod=${mod/.wsgi:/.asgi:}; fi
+  fi
+  if [[ -z $mod ]]; then
+    printf "echo 'srv: no app module found for %s — set one with: srv site set %s PY_APP project.wsgi:application' >&2; sleep 30; exit 1" "$d" "$d"
+    return 0
+  fi
+  if [[ $server == uvicorn ]]; then
+    printf "uvicorn '%s' --host 127.0.0.1 --port %s --workers %s --proxy-headers --forwarded-allow-ips 127.0.0.1" "$mod" "$port" "$w"
+  else
+    printf "gunicorn --bind 127.0.0.1:%s --workers %s --timeout %s --forwarded-allow-ips 127.0.0.1 --access-logfile - --error-logfile - '%s'" \
+      "$port" "$w" "$(site_get "$d" TIMEOUT 60)" "$mod"
+  fi
+}
+
+app_render_launcher() {
+  local d=$1 type home app port extra
+  type=$(site_get "$d" TYPE); home=$(site_get "$d" HOME_DIR); app=$(site_get "$d" APP_DIR); port=$(site_get "$d" PORT)
+  extra="PYTHONUNBUFFERED=1"; if [[ $type == node ]]; then extra="NODE_ENV=production"; fi
+  install -d -m 755 "$SRV_RUN"
+  cat >"$SRV_RUN/$d.sh" <<EOF
+#!/bin/bash
+# Managed by srv — regenerated by 'srv site rebuild $d'. Don't edit:
+# change settings with 'srv site set $d KEY value' and put environment
+# variables in $home/app.env (KEY=value per line, shell syntax).
+set -a
+HOME=$home
+PATH=$(app_path "$d")
+$extra
+if [ -f $home/app.env ]; then . $home/app.env; fi
+PORT=$port
+HOST=127.0.0.1
+set +a
+cd $app || exit 1
+exec $(app_command "$d")
+EOF
+  chmod 755 "$SRV_RUN/$d.sh"
+}
+
+# Run a shell command in the app folder as the site user, with app.env loaded.
+app_exec() {
+  local d=$1 cmd=$2 user home app rc=0
+  user=$(site_get "$d" SITE_USER); home=$(site_get "$d" HOME_DIR); app=$(site_get "$d" APP_DIR)
+  log "EXEC  [$d] $cmd"
+  runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" LANG=C.UTF-8 TERM=dumb \
+      PATH="$(app_path "$d")" COREPACK_ENABLE_DOWNLOAD_PROMPT=0 npm_config_update_notifier=false \
+      npm_config_fund=false PIP_DISABLE_PIP_VERSION_CHECK=1 \
+      bash -c 'set -a; if [ -f "$HOME/app.env" ]; then . "$HOME/app.env"; fi; set +a; cd "$1" && eval "$2"' srv-exec "$app" "$cmd" 9>&- 2>&1 \
+    | tee -a "$SRV_LOG" | sed 's/^/     │ /' >&2 || rc=$?
+  return "$rc"
+}
+
+node_install_cmd() {
+  local a=$1
+  if   [[ -f $a/pnpm-lock.yaml ]]; then echo "pnpm install --frozen-lockfile"
+  elif [[ -f $a/yarn.lock ]]; then echo "yarn install"
+  elif [[ -f $a/package-lock.json || -f $a/npm-shrinkwrap.json ]]; then echo "npm ci --include=dev"
+  else echo "npm install --include=dev"; fi
+}
+
+sv_update() { run supervisorctl reread && run supervisorctl update; }
+
+# ── PM2 (one PM2 daemon per site user, started at boot by pm2-<user>.service)
+pm2_as() {
+  local d=$1; shift
+  local user home; user=$(site_get "$d" SITE_USER); home=$(site_get "$d" HOME_DIR)
+  runuser -u "$user" -- env -i HOME="$home" USER="$user" PATH="/usr/local/bin:/usr/bin:/bin" PM2_HOME="$home/.pm2" /usr/local/bin/pm2 "$@" 9>&-
+}
+pm2_alive() {
+  local pidf pid; pidf="$(site_get "$1" HOME_DIR)/.pm2/pm2.pid"
+  [[ -f $pidf ]] || return 1
+  pid=$(<"$pidf"); [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null
+}
+pm2_write_unit() {
+  local d=$1 user home; user=$(site_get "$d" SITE_USER); home=$(site_get "$d" HOME_DIR)
+  cat >"/etc/systemd/system/pm2-$user.service" <<EOF
+# Managed by srv — restores $d's PM2 processes at boot
+[Unit]
+Description=PM2 for $d (user $user)
+After=network.target
+
+[Service]
+Type=forking
+User=$user
+LimitNOFILE=65535
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=HOME=$home
+Environment=PM2_HOME=$home/.pm2
+PIDFile=$home/.pm2/pm2.pid
+Restart=on-failure
+ExecStart=/usr/local/bin/pm2 resurrect
+ExecReload=/usr/local/bin/pm2 reload all
+ExecStop=/usr/local/bin/pm2 kill
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  run systemctl daemon-reload
+}
+
+# Write the process-manager config (does not start anything)
+pm_write() {
+  local d=$1 pm user home app unit
+  pm=$(app_pm "$d"); user=$(site_get "$d" SITE_USER); home=$(site_get "$d" HOME_DIR); app=$(site_get "$d" APP_DIR)
+  unit=$(app_unit "$d")
+  install -d -m 750 -o "$user" -g "$user" "$home/logs"
+  touch "$home/logs/app.log"; chown "$user:$user" "$home/logs/app.log"
+  case $pm in
+    systemd)
+      cat >"/etc/systemd/system/$unit.service" <<EOF
+# Managed by srv — app process for $d (srv app start|stop|restart $d)
+[Unit]
+Description=srv app $d
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=$user
+Group=$user
+WorkingDirectory=$app
+ExecStart=$SRV_RUN/$d.sh
+Restart=always
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=30
+StandardOutput=append:$home/logs/app.log
+StandardError=append:$home/logs/app.log
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+      run systemctl daemon-reload ;;
+    supervisor)
+      local autostart=false
+      if [[ $(site_get "$d" APP_ACTIVE) == yes ]]; then autostart=true; fi
+      cat >"/etc/supervisor/conf.d/$unit.conf" <<EOF
+; Managed by srv — app process for $d (srv app start|stop|restart $d)
+[program:$unit]
+command=$SRV_RUN/$d.sh
+directory=$app
+user=$user
+autostart=$autostart
+autorestart=true
+startsecs=3
+startretries=5
+stopwaitsecs=30
+stopasgroup=true
+killasgroup=true
+redirect_stderr=true
+stdout_logfile=$home/logs/app.log
+stdout_logfile_maxbytes=0
+environment=HOME="$home",USER="$user"
+EOF
+      ;;
+    pm2)
+      cat >"$SRV_RUN/$d.pm2.config.js" <<EOF
+// Managed by srv — PM2 config for $d (srv app start|stop|restart $d)
+module.exports = {
+  apps: [{
+    name: "$d",
+    script: "$SRV_RUN/$d.sh",
+    interpreter: "none",
+    cwd: "$app",
+    out_file: "$home/logs/app.log",
+    error_file: "$home/logs/app.log",
+    merge_logs: true,
+    time: true,
+    autorestart: true,
+    restart_delay: 3000,
+    max_restarts: 15,
+    kill_timeout: 10000
+  }]
+};
+EOF
+      chmod 644 "$SRV_RUN/$d.pm2.config.js"
+      pm2_write_unit "$d" ;;
+  esac
+}
+
+# Start, or restart with the latest config
+pm_start() {
+  local d=$1 unit; unit=$(app_unit "$d")
+  case $(app_pm "$d") in
+    systemd)
+      run systemctl enable "$unit.service" && run systemctl restart "$unit.service" ;;
+    supervisor)
+      sv_update || return 1
+      supervisorctl stop "$unit" >>"$SRV_LOG" 2>&1 || true
+      run supervisorctl start "$unit" ;;
+    pm2)
+      run systemctl enable "pm2-$(site_get "$d" SITE_USER).service" || true
+      run pm2_as "$d" startOrRestart "$SRV_RUN/$d.pm2.config.js" && run pm2_as "$d" save --force ;;
+  esac
+}
+
+pm_stop() {
+  local d=$1 unit; unit=$(app_unit "$d")
+  case $(app_pm "$d") in
+    systemd)    run systemctl disable --now "$unit.service" ;;
+    supervisor) supervisorctl stop "$unit" >>"$SRV_LOG" 2>&1 || true; sv_update ;;
+    pm2)
+      if pm2_alive "$d"; then
+        pm2_as "$d" delete "$d" >>"$SRV_LOG" 2>&1 || true
+        run pm2_as "$d" save --force
+      fi ;;
+  esac
+}
+
+pm_state() {
+  local d=$1 unit s pid; unit=$(app_unit "$d")
+  case $(app_pm "$d") in
+    systemd)
+      s=$(svc_state "$unit.service")
+      case $s in active) echo running ;; inactive|"") echo stopped ;; activating) echo starting ;; *) echo "$s" ;; esac ;;
+    supervisor)
+      s=$({ supervisorctl status "$unit" 2>/dev/null || true; } | awk 'NR==1 {print tolower($2)}')
+      echo "${s:-not loaded}" ;;
+    pm2)
+      if pm2_alive "$d"; then
+        pid=$({ pm2_as "$d" pid "$d" 2>/dev/null || true; } | tail -n 1)
+        if [[ $pid =~ ^[1-9][0-9]*$ ]]; then echo running; else echo stopped; fi
+      else
+        echo stopped
+      fi ;;
+  esac
+}
+
+# pm_remove domain manager — stop the process and delete that manager's config
+pm_remove() {
+  local d=$1 pm=$2 unit user; unit=$(app_unit "$d"); user=$(site_get "$d" SITE_USER)
+  case $pm in
+    systemd)
+      systemctl disable --now "$unit.service" >>"$SRV_LOG" 2>&1 || true
+      rm -f "/etc/systemd/system/$unit.service"
+      run systemctl daemon-reload || true ;;
+    supervisor)
+      supervisorctl stop "$unit" >>"$SRV_LOG" 2>&1 || true
+      rm -f "/etc/supervisor/conf.d/$unit.conf"
+      if command -v supervisorctl >/dev/null 2>&1; then sv_update || true; fi ;;
+    pm2)
+      if pm2_alive "$d"; then
+        pm2_as "$d" delete "$d" >>"$SRV_LOG" 2>&1 || true
+        pm2_as "$d" save --force >>"$SRV_LOG" 2>&1 || true
+        pm2_as "$d" kill >>"$SRV_LOG" 2>&1 || true
+      fi
+      systemctl disable "pm2-$user.service" >>"$SRV_LOG" 2>&1 || true
+      rm -f "/etc/systemd/system/pm2-$user.service" "$SRV_RUN/$d.pm2.config.js"
+      run systemctl daemon-reload || true ;;
+  esac
+}
+
+app_wait() {
+  local d=$1 port i; port=$(site_get "$d" PORT)
+  for (( i = 0; i < 20; i++ )); do
+    if port_in_use "$port"; then ok "$d is up on 127.0.0.1:$port"; return 0; fi
+    sleep 1
+  done
+  warn "$d isn't listening on port $port yet — check: srv app logs $d"
+  return 1
+}
+
+laravel_ctl() {   # start|stop|restart the Laravel worker group
+  local d=$1 action=$2 user; user=$(site_get "$d" SITE_USER)
+  [[ -f $(laravel_conf "$d") ]] || die "$d has no workers configured — set them up with: srv site workers $d"
+  run supervisorctl "$action" "srv-$user-laravel:*" || die "supervisorctl $action failed — see $SRV_LOG"
+  ok "$d workers: $action done ($(laravel_state "$d"))"
+}
+
+laravel_state() {
+  local out total run
+  out=$(supervisorctl status "srv-$(site_get "$1" SITE_USER)-laravel:*" 2>/dev/null) || true
+  total=$(grep -c . <<<"$out" || true); run=$(awk '$2=="RUNNING"' <<<"$out" | grep -c . || true)
+  if [[ -z $out ]]; then echo "not loaded"; else echo "$run/$total running"; fi
+}
+
+app_start() {
+  local d=$1 type app pm
+  type=$(site_get "$d" TYPE)
+  if [[ $type == laravel ]]; then laravel_ctl "$d" start; return 0; fi
+  is_app_type "$type" || die "$d is a $type site — it has no app process."
+  app=$(site_get "$d" APP_DIR); pm=$(app_pm "$d")
+  [[ -n $(ls -A "$app" 2>/dev/null) ]] || die "$app is empty — upload your project, then run: srv app build $d"
+  if [[ $type == python && ! -x $(site_get "$d" HOME_DIR)/venv/bin/$(site_get "$d" PY_SERVER gunicorn) ]]; then
+    die "The virtualenv isn't ready — run: srv app build $d"
+  fi
+  case $pm in pm2) ensure_feature pm2 ;; supervisor) ensure_feature supervisor ;; esac
+  site_set "$d" APP_ACTIVE yes
+  app_render_launcher "$d"
+  pm_write "$d"
+  pm_start "$d" || die "Couldn't start $d — see $SRV_LOG and: srv app logs $d"
+  app_wait "$d" || true
+}
+
+app_stop() {
+  local d=$1 type; type=$(site_get "$d" TYPE)
+  if [[ $type == laravel ]]; then laravel_ctl "$d" stop; return 0; fi
+  is_app_type "$type" || die "$d is a $type site — it has no app process."
+  site_set "$d" APP_ACTIVE no
+  pm_write "$d"
+  pm_stop "$d" || die "Couldn't stop $d — see $SRV_LOG"
+  ok "$d stopped (stays stopped after reboot — start with: srv app start $d)"
+}
+
+app_restart() {
+  local d=$1 type; type=$(site_get "$d" TYPE)
+  if [[ $type == laravel ]]; then laravel_ctl "$d" restart; return 0; fi
+  app_start "$d"
+}
+
+app_build() {
+  local d type user home app cmd
+  d=$(resolve_domain "${1:-}" apps) || exit 1
+  type=$(site_get "$d" TYPE)
+  is_app_type "$type" || die "build is for Node.js and Python apps ($d is a $type site)."
+  user=$(site_get "$d" SITE_USER); home=$(site_get "$d" HOME_DIR); app=$(site_get "$d" APP_DIR)
+  [[ -n $(ls -A "$app" 2>/dev/null) ]] || die "$app is empty — upload your project first (git clone, rsync, SFTP …)."
+  site_fix_perms "$d" 2>/dev/null
+  step "Building $d"
+  if [[ $type == node ]]; then
+    [[ -f $app/package.json ]] || die "No package.json in $app."
+    cmd=$(site_get "$d" INSTALL_CMD)
+    if [[ -z $cmd ]]; then cmd=$(node_install_cmd "$app"); fi
+    info "Installing dependencies: $cmd"
+    app_exec "$d" "$cmd" || die "Dependency install failed (see the output above)"
+    cmd=$(site_get "$d" BUILD_CMD)
+    if [[ -n $cmd ]]; then
+      info "Building: $cmd"
+      app_exec "$d" "$cmd" || die "Build failed (see the output above)"
+    fi
+  else
+    local venv="$home/venv" server pkg
+    if [[ ! -x $venv/bin/python ]]; then
+      info "Creating the virtualenv in $venv"
+      run runuser -u "$user" -- env -C "$home" python3 -m venv "$venv" || die "Couldn't create the virtualenv"
+    fi
+    app_exec "$d" "python -m pip install -q --upgrade pip wheel" || die "pip upgrade failed"
+    if [[ -f $app/requirements.txt ]]; then
+      info "Installing requirements.txt"
+      app_exec "$d" "pip install -r requirements.txt" || die "pip install failed (see the output above)"
+    elif [[ -f $app/pyproject.toml ]]; then
+      info "Installing from pyproject.toml"
+      app_exec "$d" "pip install ." || die "pip install failed (see the output above)"
+    else
+      warn "No requirements.txt or pyproject.toml — skipping dependency install"
+    fi
+    server=$(site_get "$d" PY_SERVER gunicorn)
+    if [[ ! -x $venv/bin/$server ]]; then
+      pkg=gunicorn; if [[ $server == uvicorn ]]; then pkg='uvicorn[standard]'; fi
+      info "Installing $pkg"
+      app_exec "$d" "pip install '$pkg'" || die "Installing $pkg failed"
+    fi
+    if [[ $(site_get "$d" PY_FRAMEWORK) == django && -f $app/manage.py ]]; then
+      info "Collecting static files"
+      app_exec "$d" "python manage.py collectstatic --noinput" || warn "collectstatic failed — check STATIC_ROOT in settings.py"
+    fi
+    cmd=$(site_get "$d" BUILD_CMD)
+    if [[ -n $cmd ]]; then info "Running: $cmd"; app_exec "$d" "$cmd" || die "Build command failed"; fi
+  fi
+  site_fix_perms "$d" 2>/dev/null
+  ok "Build finished"
+  app_start "$d"
+  if [[ $type == python && $(site_get "$d" PY_FRAMEWORK) == django ]]; then
+    info "Run migrations with: srv app exec $d 'python manage.py migrate'"
+  fi
+}
+
+app_exec_cmd() {
+  local d=${1:-} cmd=${2:-}
+  d=$(resolve_domain "$d" apps) || exit 1
+  is_app_type "$(site_get "$d" TYPE)" || die "exec is for Node.js and Python apps."
+  [[ -n $cmd ]] || die "Usage: srv app exec <domain> '<command>'   e.g. srv app exec $d 'python manage.py migrate'"
+  app_exec "$d" "$cmd"
+}
+
+app_list() {
+  local d any=0 type state port pm mem star=0
+  printf '%s%-34s %-8s %-11s %-6s %-14s %s%s\n' "$C_BOLD" DOMAIN TYPE MANAGER PORT STATE MEMORY "$C_0"
+  while IFS= read -r d; do
+    [[ -n $d ]] || continue
+    site_has_process "$d" || continue
+    any=1; type=$(site_get "$d" TYPE)
+    if is_app_type "$type"; then
+      pm=$(app_pm "$d"); port=$(site_get "$d" PORT); state=$(pm_state "$d")
+      if [[ $state == running ]] && ! port_in_use "$port"; then state="running*"; star=1; fi
+    else
+      pm=supervisor; port=$(site_get "$d" REVERB_PORT -); state=$(laravel_state "$d")
+    fi
+    mem="$(user_rss_mb "$(site_get "$d" SITE_USER)") MB"
+    printf '%-34s %-8s %-11s %-6s %-14s %s\n' "$d" "$type" "$pm" "$port" "$state" "$mem"
+  done < <(site_list_domains)
+  if (( ! any )); then echo "  (no apps — create one with: srv site add --type node|python)"; fi
+  if (( star )); then echo "  ${C_D}running* = process is up but not listening on its port yet${C_0}"; fi
+}
+
+app_manager() {
+  local d=${1:-} new=${2:-} old active
+  d=$(resolve_domain "$d" apps) || exit 1
+  is_app_type "$(site_get "$d" TYPE)" || die "Only Node.js and Python apps have a process manager."
+  old=$(app_pm "$d")
+  if [[ -z $new ]]; then
+    new=$(ui_menu "Process manager" "$d currently uses $old. Switch to:" \
+      systemd "systemd" pm2 "PM2" supervisor "Supervisor") || die "Cancelled."
+  fi
+  in_list "$new" systemd pm2 supervisor || die "Use systemd, pm2 or supervisor."
+  if [[ $new == "$old" ]]; then info "$d already uses $old."; return 0; fi
+  case $new in pm2) ensure_feature node; ensure_feature pm2 ;; supervisor) ensure_feature supervisor ;; esac
+  active=$(site_get "$d" APP_ACTIVE no)
+  pm_remove "$d" "$old"
+  site_set "$d" PM "$new"
+  if [[ $active == yes ]]; then app_start "$d"; else pm_write "$d"; fi
+  ok "$d now runs under $new"
+}
+
+# ── Laravel: queue workers, Horizon, Reverb (Supervisor) ─────────────────────
+sv_program() {   # name command log stopwait numprocs dir user home
+  local name=$1 cmd=$2 logf=$3 stopwait=$4 n=$5 dir=$6 user=$7 home=$8 pname='%(program_name)s'
+  if (( n > 1 )); then pname='%(program_name)s_%(process_num)02d'; fi
+  cat <<EOF
+
+[program:$name]
+command=$cmd
+directory=$dir
+user=$user
+numprocs=$n
+process_name=$pname
+autostart=true
+autorestart=true
+startsecs=1
+startretries=10
+stopasgroup=true
+killasgroup=true
+stopwaitsecs=$stopwait
+redirect_stderr=true
+stdout_logfile=$logf
+stdout_logfile_maxbytes=0
+environment=HOME="$home",USER="$user"
+EOF
+}
+
+laravel_render_workers() {
+  local d=$1 user home app php q h r rp conf
+  user=$(site_get "$d" SITE_USER); home=$(site_get "$d" HOME_DIR); app=$(site_get "$d" APP_DIR); php=$(site_get "$d" PHP)
+  q=$(site_get "$d" QUEUE_WORKERS 0); h=$(site_get "$d" HORIZON no); r=$(site_get "$d" REVERB no); rp=$(site_get "$d" REVERB_PORT)
+  conf=$(laravel_conf "$d")
+  if (( q == 0 )) && [[ $h != yes && $r != yes ]]; then
+    if [[ -f $conf ]]; then
+      supervisorctl stop "srv-$user-laravel:*" >>"$SRV_LOG" 2>&1 || true
+      rm -f "$conf"; sv_update || true
+    fi
+    return 0
+  fi
+  feat_has supervisor || { err "Supervisor isn't installed — run: srv install supervisor"; return 1; }
+  local -a progs=()
+  {
+    echo "; Managed by srv — Laravel processes for $d (change with: srv site workers $d)"
+    if [[ $h == yes ]]; then
+      progs+=("srv-$user-horizon")
+      sv_program "srv-$user-horizon" "/usr/bin/php$php $app/artisan horizon" "$home/logs/horizon.log" 3600 1 "$app" "$user" "$home"
+    elif (( q > 0 )); then
+      progs+=("srv-$user-queue")
+      sv_program "srv-$user-queue" "/usr/bin/php$php $app/artisan queue:work --sleep=3 --tries=3 --max-time=3600" \
+        "$home/logs/queue.log" 3600 "$q" "$app" "$user" "$home"
+    fi
+    if [[ $r == yes ]]; then
+      progs+=("srv-$user-reverb")
+      sv_program "srv-$user-reverb" "/usr/bin/php$php $app/artisan reverb:start --host=127.0.0.1 --port=$rp" \
+        "$home/logs/reverb.log" 30 1 "$app" "$user" "$home"
+    fi
+    echo
+    echo "[group:srv-$user-laravel]"
+    echo "programs=$(IFS=,; echo "${progs[*]}")"
+  } >"$conf"
+  sv_update || return 1
+}
+
+site_workers() {
+  local d="" q="" h="" r=""
+  while (( $# )); do
+    case $1 in
+      --queue)      need_val "$@"; q=$2; shift 2 ;;
+      --horizon)    h=yes; shift ;;
+      --no-horizon) h=no; shift ;;
+      --reverb)     r=yes; shift ;;
+      --no-reverb)  r=no; shift ;;
+      -*)           die "Unknown option: $1" ;;
+      *)            d=$1; shift ;;
+    esac
+  done
+  d=$(resolve_domain "$d") || exit 1
+  [[ $(site_get "$d" TYPE) == laravel ]] || die "Workers are for Laravel sites ($d is $(site_get "$d" TYPE))."
+  local cq ch cr
+  cq=$(site_get "$d" QUEUE_WORKERS 0); ch=$(site_get "$d" HORIZON no); cr=$(site_get "$d" REVERB no)
+  if [[ -z $q && -z $h && -z $r ]]; then
+    if (( ! INTERACTIVE )); then
+      echo "$d — queue workers: $cq · Horizon: $ch · Reverb: $cr"
+      echo "Change with: srv site workers $d [--queue N] [--horizon|--no-horizon] [--reverb|--no-reverb]"
+      return 0
+    fi
+    if ui_yesno "Use Laravel Horizon to run the queues? (needs Redis and the laravel/horizon package)" "$ch"; then h=yes; q=0; else h=no; fi
+    if [[ $h == no ]]; then
+      while true; do
+        q=$(ui_input "Number of queue:work processes (0 = none)" "$(( cq > 0 ? cq : 1 ))") || die "Cancelled."
+        if [[ $q =~ ^[0-9]+$ ]] && (( q <= 32 )); then break; fi
+        warn "Enter a number from 0 to 32"
+      done
+    fi
+    if ui_yesno "Run Laravel Reverb (WebSockets)? Nginx will send /app/* and /apps/* to it." "$cr"; then r=yes; else r=no; fi
+  fi
+  q=${q:-$cq}; h=${h:-$ch}; r=${r:-$cr}
+  [[ $q =~ ^[0-9]+$ ]] && (( q <= 32 )) || die "Queue workers must be 0–32."
+  if [[ $h == yes ]]; then q=0; fi
+  if (( q > 0 )) || [[ $h == yes || $r == yes ]]; then ensure_feature supervisor; fi
+  if [[ $h == yes && $(site_get "$d" REDIS no) != yes ]]; then warn "Horizon needs Redis — enable it with: srv site redis $d on"; fi
+  if [[ $r == yes && -z $(site_get "$d" REVERB_PORT) ]]; then site_set "$d" REVERB_PORT "$(port_alloc)"; fi
+  site_set "$d" QUEUE_WORKERS "$q"; site_set "$d" HORIZON "$h"; site_set "$d" REVERB "$r"
+  laravel_render_workers "$d" || die "Worker setup failed — see $SRV_LOG"
+  if [[ $r != "$cr" ]]; then site_apply_nginx "$d" || die "Nginx update failed"; fi
+  ok "$d — queue workers: $q · Horizon: $h · Reverb: $r$([[ $r == yes ]] && echo " (port $(site_get "$d" REVERB_PORT))")"
+  if [[ ! -f $(site_get "$d" APP_DIR)/artisan ]] && { (( q > 0 )) || [[ $h == yes || $r == yes ]]; }; then
+    warn "No artisan file yet — after uploading your app run: srv app restart $d"
+  fi
+  if [[ $r == yes ]]; then info "Write the Reverb settings into .env: srv site apply-env $d"; fi
+}
+
+cmd_app() {
+  local sub=${1:-}; shift || true
+  local d
+  case $sub in
+    list|ls|status) if [[ -z ${1:-} ]]; then app_list; return 0; fi ;;
+  esac
+  case $sub in
+    list|ls)        app_list ;;
+    status)         d=$(resolve_domain "$1" apps) || exit 1
+                    if is_app_type "$(site_get "$d" TYPE)"; then echo "$d: $(pm_state "$d") ($(app_pm "$d"), port $(site_get "$d" PORT))"
+                    else echo "$d: workers $(laravel_state "$d")"; fi ;;
+    build|deploy)   app_build "${1:-}" ;;
+    start)          d=$(resolve_domain "${1:-}" apps) || exit 1; app_start "$d" ;;
+    stop)           d=$(resolve_domain "${1:-}" apps) || exit 1; app_stop "$d" ;;
+    restart)        d=$(resolve_domain "${1:-}" apps) || exit 1; app_restart "$d" ;;
+    logs|log)
+      d=$(resolve_domain "${1:-}" apps) || exit 1
+      if [[ -n ${2:-} ]]; then site_logs "$d" "$2"
+      elif is_app_type "$(site_get "$d" TYPE)"; then site_logs "$d" app
+      else
+        local k; for k in horizon queue reverb; do
+          if [[ -f $(site_get "$d" HOME_DIR)/logs/$k.log ]]; then site_logs "$d" "$k"; return 0; fi
+        done
+        site_logs "$d" laravel
+      fi ;;
+    manager|pm)     app_manager "$@" ;;
+    exec|run)       app_exec_cmd "$@" ;;
+    ""|menu)        menu_apps ;;
+    *) die "Unknown app command: $sub (see: srv help)" ;;
   esac
 }
 
@@ -1939,6 +3536,7 @@ ssl_issue() {
   site_set "$d" SSL_NAMES "${good[*]}"
   site_apply_nginx "$d" || return 1
   ok "HTTPS enabled: https://$d"
+  if [[ $(site_get "$d" TYPE) == laravel ]]; then info "Update APP_URL (and Reverb) in .env: srv site apply-env $d"; fi
 }
 
 cmd_ssl() {
@@ -1962,94 +3560,113 @@ cmd_ssl() {
 }
 
 # =============================================================================
-#  DATABASES
+#  DATABASES (MySQL/MariaDB and PostgreSQL)
 # =============================================================================
-site_for_db() {   # site_for_db KEY VALUE → prints the site using it
+site_for_db() {   # site_for_db KEY VALUE ENGINE → prints the site using it
   local d
   while IFS= read -r d; do
     [[ -n $d ]] || continue
-    if [[ $(site_get "$d" "$1") == "$2" ]]; then printf '%s' "$d"; return 0; fi
+    if [[ $(site_get "$d" "$1") == "$2" && $(site_get "$d" DB_ENGINE mysql) == "$3" ]]; then printf '%s' "$d"; return 0; fi
   done < <(site_list_domains)
   return 1
 }
 
 db_cmd_create() {
-  local name=${1:-} user=${2:-} pass
-  if [[ -z $name ]]; then name=$(ui_input "New database name" "") || die "Cancelled."; fi
-  valid_db_ident "$name" || die "Use only letters, numbers and _ (max 64 characters)."
-  if db_exists "$name"; then die "Database $name already exists."; fi
+  local name=${1:-} user=${2:-} pass e=$DB_ENG
+  if [[ -z $name ]]; then name=$(ui_input "New $(eng_label "$e") database name" "") || die "Cancelled."; fi
+  valid_db_ident "$name" || die "Use only letters, numbers and _ (max 63 characters)."
+  if eng_exists "$e" "$name"; then die "Database $name already exists."; fi
   if [[ -z $user ]]; then user=$(ui_input "Database user" "${name:0:32}") || die "Cancelled."; fi
   if ! valid_db_ident "$user" || (( ${#user} > 32 )); then die "Invalid user name (letters, numbers, _; max 32)."; fi
-  if db_user_exists "$user"; then die "User $user already exists."; fi
+  if eng_user_exists "$e" "$user"; then die "User $user already exists."; fi
   pass=$(gen_password 24)
-  db_create "$name" "$user" "$pass" || die "Failed — see $SRV_LOG"
-  ok "Database created"
-  printf '  %-10s %s\n' Database "$name" User "$user" Password "$pass" Host "127.0.0.1:3306"
+  eng_create "$e" "$name" "$user" "$pass" || die "Failed — see $SRV_LOG"
+  ok "$(eng_label "$e") database created"
+  printf '  %-10s %s\n' Database "$name" User "$user" Password "$pass" Host "127.0.0.1:$(eng_port "$e")"
 }
 
 db_cmd_list() {
-  local rows name size
-  rows=$(db_sql "SELECT s.SCHEMA_NAME, ROUND(COALESCE(SUM(t.DATA_LENGTH + t.INDEX_LENGTH), 0) / 1048576, 2)
-    FROM information_schema.SCHEMATA s
-    LEFT JOIN information_schema.TABLES t ON t.TABLE_SCHEMA = s.SCHEMA_NAME
-    WHERE s.SCHEMA_NAME NOT IN ('information_schema','performance_schema','mysql','sys')
-    GROUP BY s.SCHEMA_NAME ORDER BY s.SCHEMA_NAME") || die "Couldn't query the database server."
-  printf '%s%-40s %10s  %s%s\n' "$C_BOLD" DATABASE "SIZE (MB)" SITE "$C_0"
-  if [[ -z $rows ]]; then echo "  (no databases)"; return 0; fi
-  while IFS=$'\t' read -r name size; do
-    printf '%-40s %10s  %s\n' "$name" "$size" "$(site_for_db DB_NAME "$name" || true)"
-  done <<<"$rows"
+  local e rows name size any=0
+  printf '%s%-12s %-36s %10s  %s%s\n' "$C_BOLD" ENGINE DATABASE "SIZE (MB)" SITE "$C_0"
+  for e in $(db_engines); do
+    if [[ $e == pgsql ]]; then
+      rows=$(pg_sql "SELECT datname, round(pg_database_size(datname) / 1048576.0, 2) FROM pg_database
+        WHERE NOT datistemplate AND datname <> 'postgres' ORDER BY 1") || { warn "Couldn't query PostgreSQL"; continue; }
+    else
+      rows=$(db_sql "SELECT s.SCHEMA_NAME, ROUND(COALESCE(SUM(t.DATA_LENGTH + t.INDEX_LENGTH), 0) / 1048576, 2)
+        FROM information_schema.SCHEMATA s
+        LEFT JOIN information_schema.TABLES t ON t.TABLE_SCHEMA = s.SCHEMA_NAME
+        WHERE s.SCHEMA_NAME NOT IN ('information_schema','performance_schema','mysql','sys')
+        GROUP BY s.SCHEMA_NAME ORDER BY s.SCHEMA_NAME") || { warn "Couldn't query MySQL/MariaDB"; continue; }
+    fi
+    [[ -n $rows ]] || continue
+    while IFS=$'\t' read -r name size; do
+      any=1
+      printf '%-12s %-36s %10s  %s\n' "$([[ $e == pgsql ]] && echo postgresql || echo mysql)" "$name" "$size" "$(site_for_db DB_NAME "$name" "$e" || true)"
+    done <<<"$rows"
+  done
+  if (( ! any )); then echo "  (no databases)"; fi
 }
 
 db_cmd_drop() {
-  local name=${1:-} u="" d=""
+  local name=${1:-} u="" d="" e=$DB_ENG
   if [[ -z $name ]]; then
     local -a items=(); local x
-    while IFS= read -r x; do if [[ -n $x ]]; then items+=("$x" "$(site_for_db DB_NAME "$x" || true)"); fi; done < <(db_user_databases)
+    while IFS= read -r x; do if [[ -n $x ]]; then items+=("$x" "$(site_for_db DB_NAME "$x" "$e" || true)"); fi; done < <(eng_databases "$e")
     (( ${#items[@]} )) || die "No databases to drop."
-    name=$(ui_menu "Drop database" "Select the database to DROP:" "${items[@]}") || die "Cancelled."
+    name=$(ui_menu "Drop database" "Select the $(eng_label "$e") database to DROP:" "${items[@]}") || die "Cancelled."
   fi
   valid_db_ident "$name" || die "Invalid database name."
-  db_exists "$name" || die "Database not found: $name"
+  eng_exists "$e" "$name" || die "$(eng_label "$e") database not found: $name"
   if (( INTERACTIVE && ! ASSUME_YES )); then
     local typed; typed=$(ui_input "Type '$name' to confirm DROP (this can't be undone)" "") || die "Cancelled."
     [[ $typed == "$name" ]] || die "Confirmation didn't match — nothing dropped."
   elif (( ! ASSUME_YES )); then
     die "Refusing to drop without --yes in non-interactive mode."
   fi
-  if d=$(site_for_db DB_NAME "$name"); then u=$(site_get "$d" DB_USER); fi
-  if [[ -z $u ]] && db_user_exists "$name"; then u=$name; fi
-  printf 'DROP DATABASE `%s`;\n' "$name" | db_run >>"$SRV_LOG" 2>&1 || die "Drop failed — see $SRV_LOG"
+  if d=$(site_for_db DB_NAME "$name" "$e"); then u=$(site_get "$d" DB_USER); fi
+  if [[ -z $u ]] && eng_user_exists "$e" "$name"; then u=$name; fi
+  eng_drop_db "$e" "$name" || die "Drop failed — see $SRV_LOG"
   ok "Database $name dropped"
   if [[ -n $u ]] && ui_yesno "Also drop the database user '$u'?" yes; then
-    printf "DROP USER IF EXISTS '%s'@'localhost';\n" "$u" | db_run >>"$SRV_LOG" 2>&1 && ok "User $u dropped"
+    eng_drop_user "$e" "$u" && ok "User $u dropped"
   fi
   if [[ -n $d ]]; then site_set "$d" DB_NAME ""; site_set "$d" DB_USER ""; site_set "$d" DB_PASS ""; fi
 }
 
 db_cmd_password() {
-  local u=${1:-} p d
-  if [[ -z $u ]]; then u=$(ui_input "Database user to reset" "") || die "Cancelled."; fi
+  local u=${1:-} p d e=$DB_ENG
+  if [[ -z $u ]]; then u=$(ui_input "$(eng_label "$e") user to reset" "") || die "Cancelled."; fi
   valid_db_ident "$u" || die "Invalid user name."
-  db_user_exists "$u" || die "User not found: $u@localhost"
+  eng_user_exists "$e" "$u" || die "User not found: $u"
   p=$(gen_password 24)
-  printf "ALTER USER '%s'@'localhost' IDENTIFIED BY '%s';\nFLUSH PRIVILEGES;\n" "$u" "$p" | db_run >>"$SRV_LOG" 2>&1 \
-    || die "Password change failed — see $SRV_LOG"
+  eng_set_password "$e" "$u" "$p" || die "Password change failed — see $SRV_LOG"
   ok "New password for $u: $p"
-  if d=$(site_for_db DB_USER "$u"); then
+  if d=$(site_for_db DB_USER "$u" "$e"); then
     site_set "$d" DB_PASS "$p"
-    info "Site $d updated — write it to .env with: srv site apply-env $d"
+    if is_app_type "$(site_get "$d" TYPE)"; then app_env_sync "$d"; info "Site $d's app.env updated — restart: srv app restart $d"
+    else info "Site $d updated — write it to .env with: srv site apply-env $d"; fi
   fi
 }
 
 cmd_db() {
   local sub=${1:-}; shift || true
-  case $sub in ""|menu) ;; *) ensure_feature database ;; esac
+  local -a rest=(); local a eng=""
+  for a in "$@"; do
+    case $a in
+      --pg|--pgsql|--postgres|--postgresql) eng=pgsql ;;
+      --mysql|--mariadb) eng=mysql ;;
+      *) rest+=("$a") ;;
+    esac
+  done
+  set -- "${rest[@]}"
   case $sub in
-    create|add)      db_cmd_create "$@" ;;
-    list|ls)         db_cmd_list ;;
-    drop|rm|delete)  db_cmd_drop "$@" ;;
-    password|passwd) db_cmd_password "$@" ;;
+    create|add)      db_pick_engine "$eng"; db_cmd_create "$@" ;;
+    list|ls)
+      if [[ -z $(db_engines) ]]; then die "No database server installed. Run: srv install database  (or: srv install postgres)"; fi
+      db_cmd_list ;;
+    drop|rm|delete)  db_pick_engine "$eng"; db_cmd_drop "$@" ;;
+    password|passwd) db_pick_engine "$eng"; db_cmd_password "$@" ;;
     ""|menu)         menu_db ;;
     *) die "Unknown db command: $sub (see: srv help)" ;;
   esac
@@ -2058,45 +3675,74 @@ cmd_db() {
 # =============================================================================
 #  BACKUPS
 # =============================================================================
-backup_db() {
-  local target="" a
-  for a in "$@"; do case $a in --all) target=__all__ ;; -*) die "Unknown option: $a" ;; *) target=$a ;; esac; done
-  target=${target:-__all__}
-  feat_has database || die "No database server installed."
-  local -a dbs=()
-  if [[ $target == __all__ ]]; then mapfile -t dbs < <(db_user_databases)
-  else db_exists "$target" || die "Database not found: $target"; dbs=("$target"); fi
-  (( ${#dbs[@]} )) || { info "No databases to back up."; return 0; }
+backup_dir_for() { if [[ $1 == pgsql ]]; then printf '%s/pgsql/%s' "$BACKUP_DIR" "$2"; else printf '%s/db/%s' "$BACKUP_DIR" "$2"; fi; }
 
-  local keep dump stamp failed=0 db dir file
-  keep=$(cfg_get BACKUP_KEEP_DAYS 7); dump=$(db_dump_bin); stamp=$(date +%Y%m%d-%H%M%S)
-  info "Backing up ${#dbs[@]} database(s) — keeping $keep days"
-  for db in "${dbs[@]}"; do
-    [[ -n $db ]] || continue
-    dir="$BACKUP_DIR/db/$db"; install -d -m 700 "$dir"
-    file="$dir/$db-$stamp.sql.gz"
-    if "$dump" --single-transaction --quick --routines --triggers --events "$db" 2>>"$SRV_LOG" | gzip -6 >"$file.part"; then
-      mv -f "$file.part" "$file"; chmod 600 "$file"
-      ok "$db → $file ($(du -h "$file" | cut -f1))"
-    else
-      rm -f "$file.part"; err "Backup failed: $db"; failed=1
-    fi
-    find "$dir" -maxdepth 1 -type f -name '*.sql.gz' -mtime +"$keep" -delete
+backup_dump() {   # engine db file
+  if [[ $1 == pgsql ]]; then
+    runuser -u postgres -- env -C / pg_dump -p "$(pg_port)" "$2" 2>>"$SRV_LOG" | gzip -6 >"$3"
+  else
+    "$(db_dump_bin)" --single-transaction --quick --routines --triggers --events "$2" 2>>"$SRV_LOG" | gzip -6 >"$3"
+  fi
+}
+
+backup_db() {
+  local target="" eng="" a
+  for a in "$@"; do
+    case $a in
+      --all) target=__all__ ;;
+      --pg|--pgsql|--postgres) eng=pgsql ;;
+      --mysql|--mariadb) eng=mysql ;;
+      -*) die "Unknown option: $a" ;;
+      *) target=$a ;;
+    esac
   done
+  target=${target:-__all__}
+  local -a engines=()
+  if [[ -n $eng ]]; then engines=("$eng"); else mapfile -t engines < <(db_engines); fi
+  (( ${#engines[@]} )) || die "No database server installed."
+
+  local keep stamp failed=0 count=0 e db dir file
+  keep=$(cfg_get BACKUP_KEEP_DAYS 7); stamp=$(date +%Y%m%d-%H%M%S)
+  for e in "${engines[@]}"; do
+    eng_installed "$e" || die "$(eng_label "$e") isn't installed."
+    local -a dbs=()
+    if [[ $target == __all__ ]]; then mapfile -t dbs < <(eng_databases "$e")
+    elif eng_exists "$e" "$target"; then dbs=("$target"); fi
+    (( ${#dbs[@]} )) || continue
+    info "$(eng_label "$e"): backing up ${#dbs[@]} database(s) — keeping $keep days"
+    for db in "${dbs[@]}"; do
+      [[ -n $db ]] || continue
+      count=$(( count + 1 ))
+      dir=$(backup_dir_for "$e" "$db"); install -d -m 700 "$dir"
+      file="$dir/$db-$stamp.sql.gz"
+      if backup_dump "$e" "$db" "$file.part"; then
+        mv -f "$file.part" "$file"; chmod 600 "$file"
+        ok "$db → $file ($(du -h "$file" | cut -f1))"
+      else
+        rm -f "$file.part"; err "Backup failed: $db"; failed=1
+      fi
+      find "$dir" -maxdepth 1 -type f -name '*.sql.gz' -mtime +"$keep" -delete
+    done
+  done
+  if [[ $target != __all__ ]] && (( count == 0 )); then die "Database not found: $target"; fi
+  if (( count == 0 )); then info "No databases to back up."; fi
   if (( failed )); then return 1; fi
 }
 
 backup_list() {
-  local f any=0
-  if [[ -d $BACKUP_DIR/db ]]; then
+  local f any=0 sub
+  for sub in db pgsql; do
+    [[ -d $BACKUP_DIR/$sub ]] || continue
     while IFS= read -r f; do
       [[ -n $f ]] || continue
       any=1; printf '%8s  %s\n' "$(du -h "$f" | cut -f1)" "$f"
-    done < <(find "$BACKUP_DIR/db" -type f -name '*.sql.gz' | sort -r)
-  fi
+    done < <(find "$BACKUP_DIR/$sub" -type f -name '*.sql.gz' | sort -r)
+  done
   if (( ! any )); then echo "  (no backups yet — run: srv backup db --all)"; return 0; fi
   echo
-  echo " Restore with:  gunzip -c <file> | $(db_client) <database>"
+  echo " Restore with:"
+  if feat_has database; then echo "   MySQL/MariaDB:  gunzip -c <file> | $(db_client) <database>"; fi
+  if feat_has postgres; then echo "   PostgreSQL:     gunzip -c <file> | runuser -u postgres -- psql -d <database>"; fi
 }
 
 cmd_backup() {
@@ -2114,12 +3760,12 @@ cmd_backup() {
 # =============================================================================
 svc_row() {
   local s; s=$(svc_state "$1")
-  if [[ $s == active ]]; then printf '  %-22s %s%s%s\n' "$1" "$C_G" "$s" "$C_0"
-  else printf '  %-22s %s%s%s\n' "$1" "$C_R" "${s:-unknown}" "$C_0"; fi
+  if [[ $s == active ]]; then printf '  %-26s %s%s%s\n' "$1" "$C_G" "$s" "$C_0"
+  else printf '  %-26s %s%s%s\n' "$1" "$C_R" "${s:-unknown}" "$C_0"; fi
 }
 
 cmd_status() {
-  local f v mem disk up
+  local f v mem disk up d
   mem=$(free -m | awk '/^Mem:/{printf "%d / %d MB used", $3, $2}')
   disk=$(df -h / | awk 'NR==2{printf "%s / %s used (%s)", $3, $2, $5}')
   up=$(uptime -p 2>/dev/null || true)
@@ -2141,15 +3787,26 @@ cmd_status() {
   if feat_has nginx; then svc_row nginx; fi
   for v in $(php_versions); do svc_row "php$v-fpm"; done
   if feat_has database; then svc_row "$( [[ $(cfg_get DB_ENGINE) == mysql ]] && echo mysql || echo mariadb )"; fi
+  if feat_has postgres; then svc_row "postgresql@$(cfg_get PG_VERSION)-main"; fi
+  if feat_has redis; then svc_row redis-server; fi
+  if feat_has supervisor; then svc_row supervisor; fi
+  while IFS= read -r d; do
+    if [[ -n $d && $(site_get "$d" PM) == pm2 && $(site_get "$d" APP_ACTIVE) == yes ]]; then
+      printf '  %-26s %s\n' "pm2-$(site_get "$d" SITE_USER)" "$(pm_state "$d") (PM2 for $d)"
+    fi
+  done < <(site_list_domains)
   if feat_has fail2ban; then svc_row fail2ban; fi
   if feat_has certbot; then svc_row certbot.timer; fi
   svc_row cron
   if command -v ufw >/dev/null 2>&1; then
-    printf '  %-22s %s\n' ufw "$(ufw status 2>/dev/null | head -n 1 | sed 's/Status: //' || true)"
+    printf '  %-26s %s\n' ufw "$(ufw status 2>/dev/null | head -n 1 | sed 's/Status: //' || true)"
   fi
 
   echo; printf '%sSites%s\n' "$C_BOLD" "$C_0"
   site_list
+  local has_apps=0
+  while IFS= read -r d; do if [[ -n $d ]] && site_has_process "$d"; then has_apps=1; break; fi; done < <(site_list_domains)
+  if (( has_apps )); then echo; printf '%sApps%s\n' "$C_BOLD" "$C_0"; app_list; fi
   if [[ -f /var/run/reboot-required ]]; then echo; warn "A reboot is required to finish updates."; fi
   echo
 }
@@ -2164,8 +3821,9 @@ main_menu() {
   while true; do
     c=$(ui_menu "srv $SRV_VERSION — $(hostname)" "What would you like to do?" \
       sites   "Sites — add, list, SSL, logs, remove …" \
+      apps    "Apps — Node.js / Python processes, Laravel workers" \
       ssl     "SSL certificates" \
-      db      "Databases" \
+      db      "Databases (MySQL/MariaDB, PostgreSQL)" \
       backup  "Backups" \
       install "Install a feature (anything skipped earlier)" \
       setup   "Run the server setup wizard" \
@@ -2174,6 +3832,7 @@ main_menu() {
     case $c in
       quit)    break ;;
       sites)   try menu_sites; continue ;;
+      apps)    try menu_apps; continue ;;
       ssl)     try menu_ssl; continue ;;
       db)      try menu_db; continue ;;
       backup)  try menu_backup; continue ;;
@@ -2194,9 +3853,11 @@ menu_sites() {
       info      "Site details" \
       ssl       "Enable HTTPS (Let's Encrypt)" \
       logs      "View recent logs" \
+      workers   "Laravel queue workers / Horizon / Reverb" \
+      redis     "Turn Redis on/off for a site" \
       fix-perms "Fix ownership & permissions" \
-      apply-env "Write DB credentials into .env" \
-      rebuild   "Regenerate Nginx / PHP config" \
+      apply-env "Write DB / Redis credentials into .env" \
+      rebuild   "Regenerate Nginx / PHP / process config" \
       enable    "Enable a site" \
       disable   "Disable a site" \
       remove    "Remove a site" \
@@ -2208,10 +3869,32 @@ menu_sites() {
       logs)
         if d=$(pick_site); then
           k=$(ui_menu "Logs: $d" "Which log?" error "Nginx error log" access "Nginx access log" \
-                php "PHP error log" laravel "Laravel log") || continue
+                app "App output (Node.js / Python)" php "PHP error log" laravel "Laravel log" \
+                queue "Queue workers" horizon "Horizon" reverb "Reverb") || continue
           try site_logs "$d" "$k"
         fi ;;
       *) try "site_${c//-/_}" ;;
+    esac
+    pause
+  done
+}
+
+menu_apps() {
+  local c d
+  while true; do
+    c=$(ui_menu "Apps" "Node.js / Python apps and Laravel workers:" \
+      list    "List apps and their state" \
+      build   "Install dependencies, build and (re)start" \
+      start   "Start" \
+      stop    "Stop" \
+      restart "Restart" \
+      logs    "Recent output" \
+      manager "Switch process manager (systemd / PM2 / Supervisor)" \
+      back    "Back") || return 0
+    case $c in
+      back) return 0 ;;
+      list) app_list ;;
+      *)    if d=$(pick_site apps); then try cmd_app "$c" "$d"; fi ;;
     esac
     pause
   done
@@ -2232,7 +3915,6 @@ menu_ssl() {
 }
 
 menu_db() {
-  ensure_feature database
   local c
   while true; do
     c=$(ui_menu "Databases" "Manage databases:" \
@@ -2270,7 +3952,7 @@ menu_backup() {
 # =============================================================================
 usage() {
   cat <<EOF
-srv $SRV_VERSION — server & site manager (Nginx · PHP · MariaDB/MySQL · Let's Encrypt)
+srv $SRV_VERSION — server & site manager (Nginx · PHP · Node.js · Python · MySQL · PostgreSQL · Redis)
 
 Usage: sudo srv [command] [options]        (no command = interactive menu)
 
@@ -2278,35 +3960,52 @@ Server
   setup                        Interactive first-time setup wizard
   install [feature] [version]  Install a feature (no name = choose from a list)
                                Features: ${FEATURES[*]}
-                               e.g. srv install php 8.3 · srv install mariadb
-  status                       Server, services, sites and certificates
-  self-install                 Copy this script to $SRV_BIN
+                               e.g. srv install php 8.3 · srv install node 22 · srv install postgres 17
+  status                       Server, services, sites, apps and certificates
+  self-install                 Copy this script to $SRV_BIN (also upgrades it)
 
 Sites
-  site add [domain] [--type static|spa|php|laravel] [--aliases "www.example.com"]
-                    [--php 8.4] [--webroot public] [--db|--no-db] [--ssl|--no-ssl]
+  site add [domain] --type static|spa|php|laravel|node|python|proxy  [options]
+      common   --aliases "www.example.com"  --db|--no-db  --mysql|--pg  --redis|--no-redis  --ssl|--no-ssl
+      PHP      --php 8.4  --webroot public
+      Node.js  --node 24  --preset next|nuxt|nest|generic  --start "npm start"  --build "npm run build"
+      Python   --framework django|flask|fastapi|other  --server gunicorn|uvicorn  --module main:app  --workers 3
+      apps     --pm systemd|pm2|supervisor  --port 3001  --websocket|--no-websocket
+      proxy    --upstream 127.0.0.1:8080  --websocket|--no-websocket
   site list
   site info <domain> [--secrets]
+  site set <domain> <KEY> <value>   Change a setting (START_CMD, PORT, PHP, UPSTREAM …) and rebuild
   site enable|disable <domain>
-  site rebuild <domain>|--all  Regenerate Nginx / PHP-FPM / cron config
+  site rebuild <domain>|--all  Regenerate Nginx / PHP-FPM / process / cron config
   site fix-perms <domain>      Reset ownership & permissions after uploading files
-  site apply-env <domain>      Write APP_URL + DB credentials into .env
-  site logs <domain> [error|access|php|laravel]
+  site apply-env <domain>      Laravel: APP_URL, DB, Redis, Reverb → .env · apps: DB/Redis → app.env
+  site workers <domain> [--queue N] [--horizon|--no-horizon] [--reverb|--no-reverb]
+  site redis <domain> on|off
+  site logs <domain> [error|access|php|laravel|app|queue|horizon|reverb]
   site remove <domain> [--purge]   --purge also deletes files, database and cert
+
+Apps (Node.js / Python processes, Laravel workers)
+  app list
+  app build <domain>           Install dependencies, build, then (re)start
+  app start|stop|restart <domain>
+  app status <domain>
+  app logs <domain> [type]
+  app exec <domain> '<cmd>'    Run a command as the app user (e.g. 'python manage.py migrate')
+  app manager <domain> [systemd|pm2|supervisor]
 
 SSL
   ssl add <domain> [--force]   Issue / expand a Let's Encrypt certificate
   ssl list
   ssl renew-test
 
-Databases
+Databases (add --mysql or --pg when both servers are installed)
   db create [name] [user]
   db list
   db drop <name>
   db password <user>           Generate a new password for a database user
 
 Backups
-  backup db [name|--all]       Dump database(s) to $BACKUP_DIR/db
+  backup db [name|--all] [--mysql|--pg]   Dump database(s) to $BACKUP_DIR
   backup list
 
 Options
@@ -2349,6 +4048,9 @@ main() {
     site)
       case ${1:-} in list|ls|info|show|logs|log) ;; *) acquire_lock ;; esac
       cmd_site "$@" ;;
+    app)
+      case ${1:-} in list|ls|status|logs|log) ;; *) acquire_lock ;; esac
+      cmd_app "$@" ;;
     ssl)     acquire_lock; cmd_ssl "$@" ;;
     db)      if [[ ${1:-} != list && ${1:-} != ls ]]; then acquire_lock; fi; cmd_db "$@" ;;
     backup)  cmd_backup "$@" ;;
