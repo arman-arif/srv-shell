@@ -888,7 +888,7 @@ nginx_write_default() {
     if [[ -f /proc/net/if_inet6 ]]; then echo "    listen [::]:80 default_server;"; fi
     echo "    server_name _;"
     echo "    access_log off;"
-    if [[ $(cfg_get TOOLS_HOST _) == _ && -f $TOOLS_CONF ]] && feat_has dbadmin; then
+    if [[ $(cfg_get TOOLS_HOST _) == _ && -f $TOOLS_CONF ]]; then
       echo "    include $TOOLS_CONF;"
       echo "    location / { return 444; }"
     else
@@ -2189,7 +2189,7 @@ site_nginx_extras() {
     echo '    location = /__srv_maintenance { internal; error_page 503 /__srv_maintenance.html; return 503; }'
     echo "    location = /__srv_maintenance.html { internal; alias $SRV_WWW/maintenance.html; default_type text/html; add_header Retry-After 300 always; add_header Cache-Control \"no-store\" always; }"
   }
-  if [[ $(cfg_get TOOLS_HOST) == "$d" && -f $TOOLS_CONF ]] && feat_has dbadmin; then
+  if [[ $(cfg_get TOOLS_HOST) == "$d" && -f $TOOLS_CONF ]]; then
     echo
     echo "    # Database tools — srv tools"
     echo "    include $TOOLS_CONF;"
@@ -5164,6 +5164,7 @@ tools_show() {
     "phpMyAdmin" "$(x=$(cfg_get TOOLS_PMA); [[ -d $TOOLS_DIR/phpmyadmin ]] && echo "${x:-installed}" || echo "not installed")"
   echo
   echo "  Then log in with a database user — sites' users work, or create an admin: srv tools db-user"
+  echo "  (MariaDB/MySQL 'root' can't log in here: it only works from the server's own shell.)"
   if [[ $(cfg_get TOOLS_HOST _) == _ && -z $(cfg_get TOOLS_ALLOW) ]]; then
     warn "The tools are on plain HTTP and open to any IP — restrict them: srv tools allow \"<your IP>\""
   elif [[ $(cfg_get TOOLS_HOST _) != _ && $(site_get "$(cfg_get TOOLS_HOST)" SSL) != yes ]]; then
