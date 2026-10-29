@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  srv — single-file server & site manager for Nginx-based web hosting
-#  Version 2.0.0 (Phase 2)
+#  Version 3.0.0 (Phase 3)
 #
 #  What it does
 #    • Setup wizard: system upgrade, timezone, hostname, swap, sudo user,
@@ -15,6 +15,11 @@
 #      PostgreSQL), optional Redis and HTTPS.
 #    • Apps run under systemd, PM2 or Supervisor — one set of commands for all
 #    • Laravel queue workers, Horizon and Reverb via Supervisor
+#    • Git deploys: releases + atomic "current" switch, shared files, build
+#      hooks, migrations, health check with automatic rollback, deploy keys,
+#      webhooks (GitHub / GitLab / Bitbucket), maintenance mode
+#    • Backups: databases + site files, rotation, restore, remote copies
+#      via rclone (S3, R2, B2, Google Drive …)
 #    • Anything skipped during setup can be installed later:  srv install
 #
 #  Supported OS: Ubuntu 22.04+ LTS, Debian 12+
@@ -30,7 +35,7 @@
 set -Eeuo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-SRV_VERSION="2.0.0"
+SRV_VERSION="3.0.0"
 SRV_DIR="/etc/srv"
 SRV_STATE="$SRV_DIR/installed.conf"     # installed features
 SRV_CFG="$SRV_DIR/srv.conf"             # global settings
@@ -41,6 +46,10 @@ SRV_LIB="/opt/srv"                      # runtimes and app launchers
 SRV_RUN="$SRV_LIB/run"                  # <domain>.sh launchers, PM2 configs
 NODE_ROOT="$SRV_LIB/node"               # <major> -> versions/vX.Y.Z
 PM2_PREFIX="$SRV_LIB/pm2"
+SRV_WWW="/var/www/_srv"                 # shared pages (maintenance)
+HOOKS_DIR="/etc/srv-webhooks"           # per-site webhook secrets (readable by srv-hook)
+DEPLOY_QUEUE="/var/lib/srv/deploy-queue"
+RCLONE_CONF="$SRV_DIR/rclone.conf"
 WEB_ROOT="/var/www"
 ACME_ROOT="/var/www/_letsencrypt"
 NGINX_CUSTOM="/etc/nginx/srv-custom"
@@ -49,7 +58,7 @@ PHP_DEFAULT="8.4"
 PHP_OFFERED=(8.4 8.5 8.3 8.2 8.1)
 
 FEATURES=(upgrade timezone hostname swap sudo-user ssh firewall fail2ban auto-updates
-          nginx php composer database postgres redis node python supervisor pm2 certbot backup)
+          nginx php composer database postgres redis node python supervisor pm2 certbot backup rclone webhook)
 
 # ── Runtime state ────────────────────────────────────────────────────────────
 INTERACTIVE=0
@@ -65,11 +74,12 @@ OS_ID="" OS_VER="" OS_CODENAME="" OS_NAME=""
 MOD_OK=() MOD_FAIL=()
 NODE_LAST_MAJOR=""
 DB_ENG=""
+DEPLOY_SITE="" DEPLOY_NEW_REL="" DEPLOY_ACTIVATED=0 DEPLOY_MAINT_SET=0 DEPLOY_ENV_CREATED=0
 
 # Answers collected by the ask_* functions, consumed by the mod_* functions
 OPT_TZ="" OPT_HOSTNAME="" OPT_SWAP="" OPT_USER="" OPT_USER_KEYS="no" OPT_USER_PASS=""
 OPT_SSH_PORT="" OPT_ROOT_LOGIN="" OPT_SSH_NOPASS="no" OPT_PHP="" OPT_DB_ENGINE=""
-OPT_EMAIL="" OPT_BACKUP_KEEP="" OPT_NODE="" OPT_PG="" OPT_REDIS_POLICY=""
+OPT_EMAIL="" OPT_BACKUP_KEEP="" OPT_BACKUP_FILES="" OPT_NODE="" OPT_PG="" OPT_REDIS_POLICY=""
 
 # Answers collected while adding a site
 S_NODE="" S_PRESET="" S_START="" S_START_SET=0 S_BUILD="" S_BUILD_SET=0 S_PM="" S_PORT=""
@@ -343,9 +353,10 @@ init_dirs() {
   TMP_DIR=$(mktemp -d /tmp/srv.XXXXXX)
 }
 
-acquire_lock() {
+acquire_lock() {   # [seconds to wait]
   exec 9>/run/srv.lock
-  flock -n 9 || die "Another srv process is running. Try again when it finishes."
+  if [[ -n ${1:-} ]]; then flock -w "$1" 9 || die "Timed out waiting for another srv process to finish."
+  else flock -n 9 || die "Another srv process is running. Try again when it finishes."; fi
 }
 
 # Copy this script to /usr/local/bin/srv (also updates an older copy).
@@ -413,14 +424,16 @@ feat_desc() {
     supervisor)   echo "Supervisor — Laravel queues, Horizon, Reverb, apps" ;;
     pm2)          echo "PM2 process manager for apps (needs Node.js)" ;;
     certbot)      echo "Certbot — free Let's Encrypt SSL" ;;
-    backup)       echo "Daily database backups with rotation" ;;
+    backup)       echo "Daily backups — databases + site files, with rotation" ;;
+    rclone)       echo "rclone — copy backups to S3, R2, B2, Google Drive …" ;;
+    webhook)      echo "Deploy webhook receiver (auto-deploy on git push)" ;;
     *)            echo "$1" ;;
   esac
 }
 
 feat_default() {
   case $1 in
-    hostname|sudo-user|postgres|redis|node|python|supervisor|pm2) echo OFF ;;
+    hostname|sudo-user|postgres|redis|node|python|supervisor|pm2|rclone|webhook) echo OFF ;;
     swap) if [[ -n $(swapon --show --noheadings 2>/dev/null) ]]; then echo OFF; else echo ON; fi ;;
     *) echo ON ;;
   esac
@@ -818,6 +831,17 @@ map $http_upgrade $connection_upgrade {
     default upgrade;
     ''      close;
 }
+EOF
+  fi
+  install -d -m 755 "$SRV_WWW"
+  if [[ ! -f $SRV_WWW/maintenance.html ]]; then
+    cat >"$SRV_WWW/maintenance.html" <<'EOF'
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Down for maintenance</title>
+<style>body{font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#f6f7f9;color:#222}
+main{max-width:32rem;padding:2rem;text-align:center}h1{font-size:1.6rem}p{color:#555;line-height:1.5}</style></head>
+<body><main><h1>We'll be right back</h1><p>This site is down for scheduled maintenance. Please check back in a few minutes.</p></main></body></html>
 EOF
   fi
   # Site logs: PHP errors and app/worker output. copytruncate because the
@@ -1429,26 +1453,190 @@ ask_backup() {
     warn "Enter a number of days (1 or more)"; retry_or_die "Invalid number of days: $d"
   done
   OPT_BACKUP_KEEP=$d
+  if ui_yesno "Also back up site files (code, uploads, .env)?" "$(cfg_get BACKUP_FILES yes)"; then OPT_BACKUP_FILES=yes; else OPT_BACKUP_FILES=no; fi
 }
 mod_backup() {
-  if ! feat_has database && ! feat_has postgres; then
-    err "A database server is required first — run: srv install database  (or: srv install postgres)"; return 1
-  fi
-  step "Scheduling daily database backups"
+  step "Scheduling daily backups"
   self_install
   [[ -x $SRV_BIN ]] || { err "$SRV_BIN is missing — copy srv.sh there first"; return 1; }
   local keep=${OPT_BACKUP_KEEP:-$(cfg_get BACKUP_KEEP_DAYS 7)}
+  local files=${OPT_BACKUP_FILES:-$(cfg_get BACKUP_FILES yes)}
   cfg_set BACKUP_KEEP_DAYS "$keep"
+  cfg_set BACKUP_FILES "$files"
   install -d -m 700 "$BACKUP_DIR"
   cat >/etc/cron.d/srv-backup <<EOF
-# Managed by srv — daily database backups (MySQL/MariaDB and PostgreSQL)
+# Managed by srv — daily backups (databases, site files, remote copy)
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-30 2 * * * root $SRV_BIN backup db --all >>/var/log/srv-backup.log 2>&1
+30 2 * * * root $SRV_BIN backup run >>/var/log/srv-backup.log 2>&1
 EOF
   chmod 644 /etc/cron.d/srv-backup
-  feat_set backup "daily 02:30, keep ${keep}d"
+  if [[ -z $(db_engines) && $files != yes ]]; then warn "No database server and file backups are off — nothing to back up yet."; fi
+  feat_set backup "daily 02:30, keep ${keep}d, databases$([[ $files == yes ]] && echo " + site files")"
   ok "Daily backups at 02:30 → $BACKUP_DIR (kept $keep days)"
+  info "Copy them off the server too: srv backup remote setup"
+}
+
+# ── rclone ───────────────────────────────────────────────────────────────────
+mod_rclone() {
+  step "Installing rclone"
+  apt_install rclone || return 1
+  touch "$RCLONE_CONF"; chmod 600 "$RCLONE_CONF"
+  feat_set rclone "$(rclone version 2>/dev/null | head -n 1 | awk '{print $2}')"
+  ok "rclone $(feat_get rclone) installed — configure it with: srv backup remote setup"
+}
+
+# ── webhook ──────────────────────────────────────────────────────────────────
+# A tiny receiver (Python, unprivileged user srv-hook) checks the signature and
+# drops "<domain>" into $DEPLOY_QUEUE. A systemd path unit then runs
+# 'srv deploy --run-queue' as root. The receiver can only request deploys of
+# sites that have a webhook secret — it never runs commands itself.
+webhook_write_receiver() {
+  cat >"$SRV_LIB/webhook.py" <<'PYEOF2'
+#!/usr/bin/env python3
+# Managed by srv — deploy webhook receiver (GitHub, GitLab, Bitbucket, generic)
+import hashlib, hmac, json, os, re, sys, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+SECRETS = "/etc/srv-webhooks"
+QUEUE = "/var/lib/srv/deploy-queue"
+DOMAIN = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")
+
+class Hook(BaseHTTPRequestHandler):
+    server_version = "srv-webhook"
+
+    def reply(self, code, msg):
+        body = (msg + "\n").encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self.reply(405, "send a POST")
+
+    def do_POST(self):
+        site = self.headers.get("X-Srv-Site", "")
+        if not DOMAIN.match(site) or ".." in site:
+            return self.reply(404, "unknown site")
+        try:
+            with open(os.path.join(SECRETS, site + ".json")) as f:
+                cfg = json.load(f)
+        except (OSError, ValueError):
+            return self.reply(404, "no webhook for this site")
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > 10_000_000:
+            return self.reply(413, "payload too large")
+        body = self.rfile.read(length) if length else b""
+        secret = cfg["secret"].encode()
+        sig = self.headers.get("X-Hub-Signature-256") or self.headers.get("X-Hub-Signature") or ""
+        if sig.startswith("sha256="):            # GitHub, Bitbucket, Gitea
+            good = hmac.compare_digest(sig, "sha256=" + hmac.new(secret, body, hashlib.sha256).hexdigest())
+        elif "X-Gitlab-Token" in self.headers:  # GitLab
+            good = hmac.compare_digest(self.headers["X-Gitlab-Token"].encode(), secret)
+        else:                                    # anything else: header or ?token=
+            token = self.headers.get("X-Srv-Token") or (parse_qs(urlparse(self.path).query).get("token") or [""])[0]
+            good = bool(token) and hmac.compare_digest(token.encode(), secret)
+        if not good:
+            return self.reply(403, "bad signature or token")
+        event = self.headers.get("X-GitHub-Event") or self.headers.get("X-Gitea-Event") or ""
+        if event == "ping":
+            return self.reply(200, "pong")
+        ref = ""
+        try:
+            data = json.loads(body or b"{}")
+            ref = data.get("ref") or ""
+            changes = (data.get("push") or {}).get("changes") or []     # Bitbucket
+            if not ref and changes and changes[0].get("new"):
+                ref = "refs/heads/" + (changes[0]["new"].get("name") or "")
+        except (ValueError, AttributeError):
+            pass
+        branch = cfg.get("branch") or ""
+        if ref and branch and ref != "refs/heads/" + branch:
+            return self.reply(202, "ignored: %s is not %s" % (ref, branch))
+        with open(os.path.join(QUEUE, site), "w") as f:
+            f.write(str(int(time.time())))
+        self.reply(202, "deploy queued")
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s %s\n" % (self.headers.get("X-Srv-Site", "-") if hasattr(self, "headers") else "-", fmt % args))
+
+ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Hook).serve_forever()
+PYEOF2
+  chmod 755 "$SRV_LIB/webhook.py"
+}
+
+mod_webhook() {
+  step "Setting up the deploy webhook receiver"
+  apt_install python3 || return 1
+  self_install
+  if ! id srv-hook &>/dev/null; then
+    run useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin srv-hook || return 1
+  fi
+  install -d -m 750 -o root -g srv-hook "$HOOKS_DIR"
+  install -d -m 755 /var/lib/srv
+  install -d -m 700 -o srv-hook -g srv-hook "$DEPLOY_QUEUE"
+  install -d -m 755 "$SRV_LIB"
+  local port; port=$(cfg_get WEBHOOK_PORT)
+  if [[ -z $port ]]; then
+    port=9000
+    while port_in_use "$port" || port_used_by_site "$port"; do port=$(( port + 1 )); done
+    cfg_set WEBHOOK_PORT "$port"
+  fi
+  webhook_write_receiver
+  cat >/etc/systemd/system/srv-webhook.service <<EOF
+# Managed by srv
+[Unit]
+Description=srv deploy webhook receiver
+After=network.target
+
+[Service]
+User=srv-hook
+Group=srv-hook
+ExecStart=/usr/bin/python3 $SRV_LIB/webhook.py $port
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=$DEPLOY_QUEUE
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat >/etc/systemd/system/srv-deploy-queue.path <<EOF
+# Managed by srv
+[Unit]
+Description=srv — watch for webhook deploys
+
+[Path]
+DirectoryNotEmpty=$DEPLOY_QUEUE
+
+[Install]
+WantedBy=paths.target
+EOF
+  cat >/etc/systemd/system/srv-deploy-queue.service <<EOF
+# Managed by srv
+[Unit]
+Description=srv — run queued webhook deploys
+
+[Service]
+Type=oneshot
+Environment=SRV_TRIGGER=webhook
+ExecStart=$SRV_BIN deploy --run-queue
+EOF
+  run systemctl daemon-reload
+  run systemctl enable srv-webhook.service srv-deploy-queue.path
+  run systemctl restart srv-webhook.service
+  run systemctl start srv-deploy-queue.path
+  local i
+  for (( i = 0; i < 10; i++ )); do if port_in_use "$port"; then break; fi; sleep 1; done
+  port_in_use "$port" || { err "The webhook receiver isn't listening on 127.0.0.1:$port — see: journalctl -u srv-webhook"; return 1; }
+  feat_set webhook "127.0.0.1:$port"
+  ok "Webhook receiver running on 127.0.0.1:$port (enable per site: srv deploy webhook <domain> on)"
 }
 
 # ── Feature orchestration ────────────────────────────────────────────────────
@@ -1467,7 +1655,7 @@ feature_summary() {
       redis)     extra="memory policy: $OPT_REDIS_POLICY" ;;
       node)      extra="Node.js $OPT_NODE" ;;
       certbot)   extra=${OPT_EMAIL:-no email} ;;
-      backup)    extra="keep $OPT_BACKUP_KEEP days" ;;
+      backup)    extra="keep $OPT_BACKUP_KEEP days, site files: $OPT_BACKUP_FILES" ;;
       *)         extra="" ;;
     esac
     printf '  • %-13s %s\n' "$f" "$extra"
@@ -1484,8 +1672,6 @@ install_features() {
   local -a want=("$@") final=(); local f
   if in_list composer "${want[@]}" && ! in_list php "${want[@]}" && ! feat_has php; then want+=(php); info "Adding php (required by composer)"; fi
   if in_list pm2 "${want[@]}" && ! in_list node "${want[@]}" && ! feat_has node; then want+=(node); info "Adding node (required by pm2)"; fi
-  if in_list backup "${want[@]}" && ! in_list database "${want[@]}" && ! in_list postgres "${want[@]}" \
-     && ! feat_has database && ! feat_has postgres; then want+=(database); info "Adding database (required by backup)"; fi
   for f in "${FEATURES[@]}"; do
     if in_list "$f" "${want[@]}"; then final+=("$f"); fi
   done
@@ -1656,11 +1842,13 @@ pick_site() {
   while IFS= read -r d; do
     [[ -n $d ]] || continue
     if [[ $filter == apps ]] && ! site_has_process "$d"; then continue; fi
+    if [[ $filter == deploy ]] && ! deploy_enabled "$d"; then continue; fi
     ssl=""; if [[ $(site_get "$d" SSL) == yes ]]; then ssl=", https"; fi
     items+=("$d" "$(site_get "$d" TYPE)$ssl")
   done < <(site_list_domains)
   if (( ! ${#items[@]} )); then
     if [[ $filter == apps ]]; then warn "No apps yet — create one with: srv site add --type node|python"
+    elif [[ $filter == deploy ]]; then warn "No site deploys from git yet — set one up with: srv deploy setup <domain>"
     else warn "No sites yet — create one with: srv site add"; fi
     return 1
   fi
@@ -1950,6 +2138,40 @@ EOF
   fi
 }
 
+# Maintenance mode + deploy webhook (rendered into the server{} that serves the site)
+site_nginx_extras() {
+  local d=$1 home ip
+  home=$(site_get "$d" HOME_DIR)
+  echo
+  echo "    # Maintenance mode — srv site maintenance $d on|off (no reload needed)"
+  # shellcheck disable=SC2016
+  {
+    echo '    set $srv_maint 0;'
+    echo "    if (-f $home/.maintenance) { set \$srv_maint 1; }"
+    echo '    if ($uri ~ ^/(\.well-known/|_srv/deploy$|__srv_maintenance)) { set $srv_maint 0; }'
+    for ip in $(site_get "$d" MAINT_ALLOW); do echo "    if (\$remote_addr = $ip) { set \$srv_maint 0; }"; done
+    echo '    if ($srv_maint) { rewrite ^ /__srv_maintenance last; }'
+    echo '    location = /__srv_maintenance { internal; error_page 503 /__srv_maintenance.html; return 503; }'
+    echo "    location = /__srv_maintenance.html { internal; alias $SRV_WWW/maintenance.html; default_type text/html; add_header Retry-After 300 always; add_header Cache-Control \"no-store\" always; }"
+  }
+  if [[ $(site_get "$d" DEPLOY_WEBHOOK) == yes && -n $(cfg_get WEBHOOK_PORT) ]]; then
+    cat <<EOF
+
+    # Deploy webhook — srv deploy webhook $d
+    location = /_srv/deploy {
+        proxy_pass http://127.0.0.1:$(cfg_get WEBHOOK_PORT);
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Srv-Site $d;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header Connection "";
+        client_max_body_size 10m;
+        proxy_read_timeout 30s;
+    }
+EOF
+  fi
+}
+
 site_render_nginx() {
   local d=$1 aliases ssl names v6=0 nv h2_listen=" http2" h2_on=0
   aliases=$(site_get "$d" ALIASES); ssl=$(site_get "$d" SSL no)
@@ -1987,6 +2209,7 @@ site_render_nginx() {
     echo "    ssl_certificate_key /etc/letsencrypt/live/$d/privkey.pem;"
     echo "    include snippets/srv-ssl.conf;"
   fi
+  site_nginx_extras "$d"
   site_nginx_body "$d"
   echo "}"
 }
@@ -2222,7 +2445,7 @@ site_ask_pm() {
 # ── site add ─────────────────────────────────────────────────────────────────
 site_add() {
   local domain="" aliases="" aliases_set=0 type="" php="" webroot="" webroot_set=0
-  local want_db="" want_ssl="" want_redis="" engine="" want_workers=no
+  local want_db="" want_ssl="" want_redis="" engine="" want_workers=no repo="" branch=""
   S_NODE="" S_PRESET="" S_START="" S_START_SET=0 S_BUILD="" S_BUILD_SET=0 S_PM="" S_PORT=""
   S_FRAMEWORK="" S_SERVER="" S_MODULE="" S_MODULE_SET=0 S_WORKERS="" S_UPSTREAM="" S_WS="" S_PRESERVE=""
   while (( $# )); do
@@ -2253,6 +2476,8 @@ site_add() {
       --redis)        want_redis=yes; shift ;;
       --no-redis)     want_redis=no; shift ;;
       --ssl)          want_ssl=yes; shift ;;
+      --repo)         need_val "$@"; repo=$2; shift 2 ;;
+      --branch)       need_val "$@"; branch=$2; shift 2 ;;
       --no-ssl)       want_ssl=no; shift ;;
       -*)             die "Unknown option: $1" ;;
       *)              domain=$1; shift ;;
@@ -2387,6 +2612,21 @@ site_add() {
     want_redis=no
   fi
 
+  # Deploy from git?
+  if [[ -z $repo && $type != proxy ]] && (( INTERACTIVE && ! ASSUME_YES )); then
+    if ui_yesno "Deploy this site from a git repository? (releases, rollback, auto-deploy)" no; then
+      while true; do
+        repo=$(ui_input "Git repository (git@github.com:you/app.git or https://…)" "") || die "Cancelled."
+        if valid_repo "$repo"; then break; fi
+        warn "That doesn't look like a git URL"
+      done
+    fi
+  fi
+  if [[ -n $repo ]]; then
+    valid_repo "$repo" || die "Invalid repository URL: $repo"
+    [[ $type != proxy ]] || die "Proxy sites don't deploy code."
+  fi
+
   # Laravel queue workers / Horizon / Reverb
   if [[ $type == laravel ]] && (( INTERACTIVE && ! ASSUME_YES )); then
     if ui_yesno "Set up queue workers, Horizon or Reverb now? (runs under Supervisor)" no; then want_workers=yes; fi
@@ -2421,7 +2661,11 @@ site_add() {
   step "Creating site $domain"
   if [[ -d $home ]]; then warn "$home already exists — reusing it"; fi
   if ! id "$user" &>/dev/null; then
-    run useradd --home-dir "$home" --no-create-home --shell /bin/bash --user-group "$user" || die "Could not create user $user"
+    if getent group "$user" >/dev/null; then   # left over from an earlier site with this name
+      run useradd --home-dir "$home" --no-create-home --shell /bin/bash -g "$user" "$user" || die "Could not create user $user"
+    else
+      run useradd --home-dir "$home" --no-create-home --shell /bin/bash --user-group "$user" || die "Could not create user $user"
+    fi
   fi
   mkdir -p "$app" "$home/logs" "$home/tmp"
   # Laravel and apps: keep app/ empty so the project can be cloned straight into it
@@ -2479,7 +2723,13 @@ site_add() {
     if ! ssl_issue "$domain" 0; then warn "HTTPS isn't enabled yet — fix DNS, then run: srv ssl add $domain"; fi
   fi
   if [[ $want_workers == yes ]]; then try site_workers "$domain"; fi
+  if [[ -n $repo ]]; then site_set "$domain" REPO "$repo"; site_set "$domain" BRANCH "${branch:-main}"; fi
   site_summary "$domain"
+  if [[ -n $repo ]]; then
+    echo
+    local -a dargs=("$domain" --repo "$repo"); if [[ -n $branch ]]; then dargs+=(--branch "$branch"); fi
+    deploy_setup "${dargs[@]}"
+  fi
 }
 
 site_summary() {
@@ -2516,22 +2766,32 @@ site_summary() {
   if [[ $(site_get "$d" REDIS) == yes ]]; then printf '  %-13s %s\n' "Redis" "127.0.0.1:6379$( is_app_type "$type" && echo " (database $(site_get "$d" REDIS_DB 0))")"; fi
   echo
   echo " Next steps"
+  if deploy_enabled "$d"; then
+    echo "   •  Deploys from $(site_get "$d" REPO) ($(site_get "$d" BRANCH main))"
+    echo "   •  Deploy again: srv deploy $d   ·   auto-deploy on push: srv deploy webhook $d on"
+    if [[ $type == laravel ]]; then echo "   •  Queue workers / Horizon / Reverb:  srv site workers $d"; fi
+    if [[ $scheme == http ]]; then echo "   •  Enable HTTPS once DNS points here:  srv ssl add $d"; fi
+    return 0
+  fi
   case $type in
     static|spa|php)
-      echo "   1. Upload your files into $(site_docroot "$d")   (git clone, rsync, SFTP …)"
-      echo "   2. srv site fix-perms $d" ;;
+      echo "   1. Upload your files into $(site_docroot "$d")   (rsync, SFTP …)"
+      echo "   2. srv site fix-perms $d"
+      echo "   •  Or deploy from git:  srv deploy setup $d" ;;
     laravel)
       echo "   1. Upload your project into $app   (git clone, rsync, SFTP …)"
       echo "   2. srv site fix-perms $d"
       echo "   3. runuser -u $user -- env -C $app composer install --no-dev --optimize-autoloader"
       echo "   4. srv site apply-env $d      # APP_URL, DB, Redis, Reverb → .env (+ APP_KEY)"
       echo "   5. runuser -u $user -- env -C $app php$php artisan migrate --force"
+      echo "   •  Or deploy from git instead of steps 1–5:  srv deploy setup $d"
       echo "   •  Queue workers / Horizon / Reverb:  srv site workers $d" ;;
     node|python)
       echo "   1. Upload your project into $app   (git clone, rsync, SFTP …)"
       echo "   2. Put your environment variables in $home/app.env"
       echo "   3. srv app build $d       # installs dependencies, builds and starts the app"
-      echo "   4. srv app logs $d" ;;
+      echo "   4. srv app logs $d"
+      echo "   •  Or deploy from git instead of steps 1 and 3:  srv deploy setup $d" ;;
     proxy)
       echo "   •  Requests to $d are forwarded to $(site_get "$d" UPSTREAM)" ;;
   esac
@@ -2565,7 +2825,7 @@ site_info() {
   while IFS= read -r line; do
     if [[ -z $line || $line == \#* ]]; then continue; fi
     k=${line%%=*}
-    if [[ $k == DB_PASS && -n ${line#*=} && $secrets -eq 0 ]]; then line="DB_PASS=******** (show with --secrets)"; fi
+    if [[ ( $k == DB_PASS || $k == WEBHOOK_SECRET ) && -n ${line#*=} && $secrets -eq 0 ]]; then line="$k=******** (show with --secrets)"; fi
     printf '  %-14s %s\n' "$k" "${line#*=}"
   done <"$(site_file "$d")"
   hr
@@ -2574,6 +2834,13 @@ site_info() {
   if is_app_type "$(site_get "$d" TYPE)"; then
     printf '  %-14s %s\n' "Launcher" "$SRV_RUN/$d.sh" "Env file" "$(site_get "$d" HOME_DIR)/app.env" "State" "$(pm_state "$d")"
   fi
+  if deploy_enabled "$d"; then
+    local cur meta; cur=$(deploy_current "$d" || echo "none yet"); meta=$(deploy_meta "$d" "$cur")
+    printf '  %-14s %s\n' "Live release" "$cur$( [[ -f $meta ]] && echo " — $(kv_get "$meta" COMMIT | cut -c1-10) $(kv_get "$meta" SUBJECT)")" \
+      "Deploy log" "$(site_get "$d" HOME_DIR)/logs/deploy.log"
+    if [[ $(site_get "$d" DEPLOY_WEBHOOK) == yes ]]; then printf '  %-14s %s\n' "Webhook" "$(webhook_url "$d")"; fi
+  fi
+  printf '  %-14s %s\n' "Maintenance" "$([[ -f $(site_get "$d" HOME_DIR)/.maintenance ]] && echo ON || echo off)"
   local days
   if days=$(cert_days_left "$d"); then printf '  %-14s %s\n' "Cert" "expires in $days days"; fi
 }
@@ -2641,6 +2908,8 @@ site_set_cmd() {
     python)      allowed="PY_APP PY_SERVER WORKERS BUILD_CMD PORT TIMEOUT WEBSOCKET MAX_BODY STATIC_DIR MEDIA_DIR" ;;
     proxy)       allowed="UPSTREAM PRESERVE_HOST TIMEOUT WEBSOCKET MAX_BODY" ;;
   esac
+  local deploy_keys="BRANCH DEPLOY_SHARED_DIRS DEPLOY_SHARED_FILES DEPLOY_BUILD DEPLOY_AFTER DEPLOY_KEEP DEPLOY_MIGRATE DEPLOY_COMPOSER DEPLOY_NPM DEPLOY_OPTIMIZE DEPLOY_HEALTH_PATH DEPLOY_AUTO_ROLLBACK"
+  if [[ $type != proxy ]]; then allowed="$allowed $deploy_keys"; fi
   # shellcheck disable=SC2086
   in_list "$k" $allowed || die "Editable keys for $type sites: $allowed"
   [[ $v != *$'\n'* ]] || die "The value must be a single line."
@@ -2658,10 +2927,20 @@ site_set_cmd() {
     NODE)        mapfile -t _vers < <(node_versions); in_list "$v" "${_vers[@]}" || die "Node $v isn't installed (installed: $(node_versions | tr '\n' ' '))" ;;
     PORT)        valid_port "$v" || die "Port must be 1024–65535"
                  if [[ $v != "$(site_get "$d" PORT)" ]] && port_used_by_site "$v"; then die "Port $v is assigned to another site"; fi ;;
+    BRANCH)      valid_ref "$v" || die "Invalid branch name" ;;
+    DEPLOY_SHARED_DIRS|DEPLOY_SHARED_FILES)
+                 local x; for x in $v; do valid_relpath "$x" && [[ $x != /* && $x != . ]] || die "Invalid path: $x"; done ;;
+    DEPLOY_KEEP) [[ $v =~ ^[0-9]+$ ]] && (( v >= 2 && v <= 50 )) || die "Keep 2–50 releases" ;;
+    DEPLOY_MIGRATE|DEPLOY_COMPOSER|DEPLOY_NPM|DEPLOY_OPTIMIZE|DEPLOY_AUTO_ROLLBACK) in_list "$v" yes no || die "Use yes or no" ;;
+    DEPLOY_HEALTH_PATH) [[ $v =~ ^/[^[:space:]]*$ ]] || die "Use a path like / or /health" ;;
   esac
   site_set "$d" "$k" "$v"
   ok "$d: $k=$v"
-  site_rebuild "$d"
+  case $k in
+    BRANCH)   if [[ $(site_get "$d" DEPLOY_WEBHOOK) == yes ]]; then webhook_write_secret "$d"; fi ;;
+    DEPLOY_*) ;;   # used by the next deploy — nothing to rebuild
+    *)        site_rebuild "$d" ;;
+  esac
 }
 
 site_fix_perms() {
@@ -2671,32 +2950,56 @@ site_fix_perms() {
   step "Fixing ownership & permissions for $d"
   mkdir -p "$home/logs" "$home/tmp"
   run chown -R "$user:$user" "$home"
-  run chmod 750 "$home" "$app" "$home/logs"
+  run chmod 750 "$home" "$home/logs"
   run chmod 700 "$home/tmp"
-  # Owner read/write; group (Nginx) read-only; others nothing. Keeps exec bits.
-  run chmod -R u+rwX,g+rX,g-w,o-rwx "$app"
+  local -a dirs=("$app")
+  if [[ $(site_get "$d" DEPLOY) == yes ]]; then dirs=("$home/releases" "$home/shared"); fi
+  local x
+  for x in "${dirs[@]}"; do
+    if [[ -d $x ]]; then
+      run chmod 750 "$x"
+      # Owner read/write; group (Nginx) read-only; others nothing. Keeps exec bits.
+      run chmod -R u+rwX,g+rX,g-w,o-rwx "$x"
+    fi
+  done
   local f
-  for f in "$app/.env" "$home/app.env"; do if [[ -f $f ]]; then run chmod 600 "$f"; fi; done
+  for f in "$app/.env" "$home/shared/.env" "$home/app.env"; do if [[ -f $f ]]; then run chmod 600 "$f"; fi; done
   ok "Owner $user (read/write), Nginx read-only, others no access"
 }
 
+laravel_env_file() {   # where the site's .env lives
+  local home; home=$(site_get "$1" HOME_DIR)
+  if [[ $(site_get "$1" DEPLOY) == yes && -e $home/shared/.env ]]; then printf '%s/shared/.env' "$home"
+  else printf '%s/.env' "$(site_get "$1" APP_DIR)"; fi
+}
+
 site_apply_env() {
-  local d type user app php dbn scheme=http env eng port
+  local d type user app php env
   d=$(resolve_domain "${1:-}") || exit 1
-  type=$(site_get "$d" TYPE); user=$(site_get "$d" SITE_USER); app=$(site_get "$d" APP_DIR)
-  php=$(site_get "$d" PHP); dbn=$(site_get "$d" DB_NAME)
+  type=$(site_get "$d" TYPE); user=$(site_get "$d" SITE_USER); app=$(site_get "$d" APP_DIR); php=$(site_get "$d" PHP)
   if is_app_type "$type"; then
     app_env_sync "$d"
     ok "$(site_get "$d" HOME_DIR)/app.env updated — restart to apply: srv app restart $d"
     return 0
   fi
   is_php_type "$type" || die "apply-env is for PHP, Laravel, Node.js and Python sites."
-  if [[ $(site_get "$d" SSL) == yes ]]; then scheme=https; fi
-  env="$app/.env"
+  env=$(laravel_env_file "$d")
   if [[ ! -f $env ]]; then
     if [[ -f $app/.env.example ]]; then cp "$app/.env.example" "$env"; info "Created .env from .env.example"
     else die "No $env or .env.example found — upload your project first."; fi
   fi
+  laravel_env_write "$d" "$env"
+  if [[ $type == laravel && -f $app/artisan && -f $app/vendor/autoload.php ]] && ! grep -qE '^APP_KEY=.+' "$env"; then
+    run runuser -u "$user" -- env -C "$app" "/usr/bin/php$php" artisan key:generate --force && ok "APP_KEY generated"
+  fi
+  if [[ $type == laravel && -f $(laravel_conf "$d") ]]; then info "Restart workers to load it: srv app restart $d"; fi
+}
+
+# Write APP_URL, DB, Redis and Reverb settings into a Laravel/PHP .env file
+laravel_env_write() {
+  local d=$1 env=$2 type user dbn scheme=http eng port
+  type=$(site_get "$d" TYPE); user=$(site_get "$d" SITE_USER); dbn=$(site_get "$d" DB_NAME)
+  if [[ $(site_get "$d" SSL) == yes ]]; then scheme=https; fi
   local -a written=(APP_URL)
   env_set "$env" APP_URL "$scheme://$d"
   if [[ -n $dbn ]]; then
@@ -2736,11 +3039,7 @@ site_apply_env() {
     written+=("REVERB_*")
   fi
   chown "$user:$user" "$env"; chmod 600 "$env"
-  if [[ $type == laravel && -f $app/artisan && -f $app/vendor/autoload.php ]] && ! grep -qE '^APP_KEY=.+' "$env"; then
-    run runuser -u "$user" -- env -C "$app" "/usr/bin/php$php" artisan key:generate --force && ok "APP_KEY generated"
-  fi
   ok ".env updated for $d: ${written[*]}"
-  if [[ $type == laravel && -f $(laravel_conf "$d") ]]; then info "Restart workers to load it: srv app restart $d"; fi
 }
 
 site_redis() {
@@ -2770,6 +3069,41 @@ site_redis() {
   else info "Write it into .env with: srv site apply-env $d"; fi
 }
 
+site_maintenance() {
+  local d="" mode="" allow="" allow_set=0 ip home
+  while (( $# )); do
+    case $1 in
+      --allow) need_val "$@"; allow=$2; allow_set=1; shift 2 ;;
+      on|off|status) mode=$1; shift ;;
+      -*) die "Unknown option: $1" ;;
+      *)  d=$1; shift ;;
+    esac
+  done
+  d=$(resolve_domain "$d") || exit 1
+  home=$(site_get "$d" HOME_DIR)
+  if [[ -z $mode ]]; then
+    if (( INTERACTIVE )); then
+      mode=$(ui_menu "Maintenance: $d" "Maintenance mode is $([[ -f $home/.maintenance ]] && echo ON || echo off):" \
+        on "Turn on (visitors get a 503 page)" off "Turn off" status "Show status") || die "Cancelled."
+    else mode=status; fi
+  fi
+  if (( allow_set )); then
+    for ip in $allow; do [[ $ip =~ ^[0-9A-Fa-f:.]+$ ]] || die "Invalid IP address: $ip"; done
+    site_set "$d" MAINT_ALLOW "$allow"
+  fi
+  if (( allow_set )) || ! grep -qs '__srv_maintenance' "/etc/nginx/sites-available/$d.conf"; then
+    site_apply_nginx "$d" || die "Nginx update failed"
+  fi
+  case $mode in
+    on)  touch "$home/.maintenance"
+         ok "Maintenance mode ON for $d$( [[ -n $(site_get "$d" MAINT_ALLOW) ]] && echo " (still open for: $(site_get "$d" MAINT_ALLOW))")"
+         info "Page shown: $SRV_WWW/maintenance.html (edit it to customise)" ;;
+    off) rm -f "${home:?}/.maintenance"; ok "Maintenance mode off for $d" ;;
+    status)
+      echo "$d: maintenance $([[ -f $home/.maintenance ]] && echo ON || echo off)$( [[ -n $(site_get "$d" MAINT_ALLOW) ]] && echo " · allowed IPs: $(site_get "$d" MAINT_ALLOW)")" ;;
+  esac
+}
+
 site_logs() {
   local d=${1:-} kind=${2:-} f home
   d=$(resolve_domain "$d") || exit 1
@@ -2781,8 +3115,8 @@ site_logs() {
     php)     f=$home/logs/php-error.log ;;
     laravel) f=$(site_get "$d" APP_DIR)/storage/logs/laravel.log ;;
     app)     f=$home/logs/app.log ;;
-    queue|horizon|reverb) f=$home/logs/$kind.log ;;
-    *) die "Log type must be one of: error, access, php, laravel, app, queue, horizon, reverb" ;;
+    queue|horizon|reverb|deploy) f=$home/logs/$kind.log ;;
+    *) die "Log type must be one of: error, access, php, laravel, app, queue, horizon, reverb, deploy" ;;
   esac
   [[ -f $f ]] || die "No log yet: $f"
   if (( MENU_MODE )); then tail -n 100 "$f"; else exec tail -n 100 -f "$f"; fi
@@ -2821,7 +3155,8 @@ site_remove() {
     supervisorctl stop "srv-$user-laravel:*" >>"$SRV_LOG" 2>&1 || true
     rm -f "$lconf"; sv_update || true
   fi
-  rm -f "$SRV_RUN/$d.sh" "$SRV_RUN/$d.pm2.config.js"
+  rm -f "${SRV_RUN:?}/${d:?}.sh" "${SRV_RUN:?}/${d:?}.pm2.config.js" "${HOOKS_DIR:?}/${d:?}.json" "${DEPLOY_QUEUE:?}/${d:?}"
+  rm -rf "${SRV_DIR:?}/releases/${d:?}"
 
   rm -f "/etc/nginx/sites-enabled/$d.conf" "/etc/nginx/sites-available/$d.conf"
   rm -rf "${NGINX_CUSTOM:?}/$d"
@@ -2850,6 +3185,8 @@ site_remove() {
       rm -rf "$home"
       rm -f "/var/log/nginx/$d."*.log*
       userdel "$user" >>"$SRV_LOG" 2>&1 || warn "Couldn't delete user $user"
+      gpasswd -d www-data "$user" >>"$SRV_LOG" 2>&1 || true
+      groupdel "$user" >>"$SRV_LOG" 2>&1 || true
       ok "Files and user $user deleted"
     else
       warn "Unexpected home path ($home) — files NOT deleted"
@@ -2875,6 +3212,8 @@ cmd_site() {
     apply-env|env)    site_apply_env "${1:-}" ;;
     workers)          site_workers "$@" ;;
     redis)            site_redis "$@" ;;
+    maintenance|maint) site_maintenance "$@" ;;
+    rollback)         deploy_rollback "$@" ;;
     logs|log)         site_logs "$@" ;;
     remove|rm|delete) site_remove "$@" ;;
     ""|menu)          menu_sites ;;
@@ -2893,18 +3232,30 @@ cmd_site() {
 app_pm()   { site_get "$1" PM systemd; }
 app_unit() { printf 'srv-%s' "$(site_get "$1" SITE_USER)"; }
 
+# Python virtualenv: per release (.venv) for git deploys, otherwise <home>/venv
+app_venv() {
+  if [[ $(site_get "$1" DEPLOY) == yes ]]; then printf '%s/.venv' "$(site_get "$1" APP_DIR)"
+  else printf '%s/venv' "$(site_get "$1" HOME_DIR)"; fi
+}
+
+node_default_bin() {
+  local m; m=$(cfg_get NODE_DEFAULT)
+  if [[ -n $m && -x $NODE_ROOT/$m/bin/node ]]; then printf '%s/%s/bin' "$NODE_ROOT" "$m"; fi
+}
+
+# app_path <domain> [venv]  → PATH for the site's commands
 app_path() {
-  local d=$1 base=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  local d=$1 venv=${2:-} base=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin nb
   case $(site_get "$d" TYPE) in
     node)   printf '%s/%s/bin:%s' "$NODE_ROOT" "$(site_get "$d" NODE)" "$base" ;;
-    python) printf '%s/venv/bin:%s' "$(site_get "$d" HOME_DIR)" "$base" ;;
-    *)      printf '%s' "$base" ;;
+    python) printf '%s/bin:%s' "${venv:-$(app_venv "$d")}" "$base" ;;
+    *)      nb=$(node_default_bin); printf '%s%s' "${nb:+$nb:}" "$base" ;;   # PHP/static builds may need npm
   esac
 }
 
 py_detect_module() {   # Django: find <project>/wsgi.py next to manage.py
   local app=$1 f
-  f=$(find "$app" -mindepth 2 -maxdepth 2 -name wsgi.py -print -quit 2>/dev/null) || true
+  f=$(find -H "$app" -mindepth 2 -maxdepth 2 -name wsgi.py -print -quit 2>/dev/null) || true
   [[ -n $f ]] || return 1
   printf '%s.wsgi:application' "$(basename "$(dirname "$f")")"
 }
@@ -2954,13 +3305,15 @@ EOF
   chmod 755 "$SRV_RUN/$d.sh"
 }
 
-# Run a shell command in the app folder as the site user, with app.env loaded.
+# app_exec <domain> <command> [dir] [PATH] — run a shell command as the site
+# user (default dir: the app folder), with <home>/app.env loaded.
 app_exec() {
-  local d=$1 cmd=$2 user home app rc=0
-  user=$(site_get "$d" SITE_USER); home=$(site_get "$d" HOME_DIR); app=$(site_get "$d" APP_DIR)
+  local d=$1 cmd=$2 dir=${3:-} path=${4:-} user home app rc=0
+  user=$(site_get "$d" SITE_USER); home=$(site_get "$d" HOME_DIR); app=${dir:-$(site_get "$d" APP_DIR)}
+  if [[ -z $path ]]; then path=$(app_path "$d"); fi
   log "EXEC  [$d] $cmd"
   runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" LANG=C.UTF-8 TERM=dumb \
-      PATH="$(app_path "$d")" COREPACK_ENABLE_DOWNLOAD_PROMPT=0 npm_config_update_notifier=false \
+      PATH="$path" COREPACK_ENABLE_DOWNLOAD_PROMPT=0 npm_config_update_notifier=false COMPOSER_HOME="$home/.composer" \
       npm_config_fund=false PIP_DISABLE_PIP_VERSION_CHECK=1 \
       bash -c 'set -a; if [ -f "$HOME/app.env" ]; then . "$HOME/app.env"; fi; set +a; cd "$1" && eval "$2"' srv-exec "$app" "$cmd" 9>&- 2>&1 \
     | tee -a "$SRV_LOG" | sed 's/^/     │ /' >&2 || rc=$?
@@ -3203,7 +3556,8 @@ app_start() {
   is_app_type "$type" || die "$d is a $type site — it has no app process."
   app=$(site_get "$d" APP_DIR); pm=$(app_pm "$d")
   [[ -n $(ls -A "$app" 2>/dev/null) ]] || die "$app is empty — upload your project, then run: srv app build $d"
-  if [[ $type == python && ! -x $(site_get "$d" HOME_DIR)/venv/bin/$(site_get "$d" PY_SERVER gunicorn) ]]; then
+  if [[ $type == python && ! -x $(app_venv "$d")/bin/$(site_get "$d" PY_SERVER gunicorn) ]]; then
+    if [[ $(site_get "$d" DEPLOY) == yes ]]; then die "The live release has no virtualenv — redeploy: srv deploy $d"; fi
     die "The virtualenv isn't ready — run: srv app build $d"
   fi
   case $pm in pm2) ensure_feature pm2 ;; supervisor) ensure_feature supervisor ;; esac
@@ -3230,55 +3584,65 @@ app_restart() {
   app_start "$d"
 }
 
+# Install Node dependencies and run the build in <dir>
+node_build() {   # domain dir PATH
+  local d=$1 dir=$2 path=$3 cmd
+  [[ -f $dir/package.json ]] || die "No package.json in $dir."
+  cmd=$(site_get "$d" INSTALL_CMD)
+  if [[ -z $cmd ]]; then cmd=$(node_install_cmd "$dir"); fi
+  info "Installing dependencies: $cmd"
+  app_exec "$d" "$cmd" "$dir" "$path" || die "Dependency install failed (see the output above)"
+  cmd=$(site_get "$d" BUILD_CMD)
+  if [[ -n $cmd ]]; then
+    info "Building: $cmd"
+    app_exec "$d" "$cmd" "$dir" "$path" || die "Build failed (see the output above)"
+  fi
+}
+
+# Create/refresh a virtualenv and install the app into it
+py_build() {   # domain dir venv
+  local d=$1 dir=$2 venv=$3 user path server pkg
+  user=$(site_get "$d" SITE_USER); path=$(app_path "$d" "$venv")
+  if [[ ! -x $venv/bin/python ]]; then
+    info "Creating the virtualenv in $venv"
+    run runuser -u "$user" -- env -C "$(site_get "$d" HOME_DIR)" python3 -m venv "$venv" || die "Couldn't create the virtualenv"
+  fi
+  app_exec "$d" "python -m pip install -q --upgrade pip wheel" "$dir" "$path" || die "pip upgrade failed"
+  if [[ -f $dir/requirements.txt ]]; then
+    info "Installing requirements.txt"
+    app_exec "$d" "pip install -r requirements.txt" "$dir" "$path" || die "pip install failed (see the output above)"
+  elif [[ -f $dir/pyproject.toml ]]; then
+    info "Installing from pyproject.toml"
+    app_exec "$d" "pip install ." "$dir" "$path" || die "pip install failed (see the output above)"
+  else
+    warn "No requirements.txt or pyproject.toml — skipping dependency install"
+  fi
+  server=$(site_get "$d" PY_SERVER gunicorn)
+  if [[ ! -x $venv/bin/$server ]]; then
+    pkg=gunicorn; if [[ $server == uvicorn ]]; then pkg='uvicorn[standard]'; fi
+    info "Installing $pkg"
+    app_exec "$d" "pip install '$pkg'" "$dir" "$path" || die "Installing $pkg failed"
+  fi
+  if [[ $(site_get "$d" PY_FRAMEWORK) == django && -f $dir/manage.py ]]; then
+    info "Collecting static files"
+    app_exec "$d" "python manage.py collectstatic --noinput" "$dir" "$path" || warn "collectstatic failed — check STATIC_ROOT in settings.py"
+  fi
+  local cmd; cmd=$(site_get "$d" BUILD_CMD)
+  if [[ -n $cmd ]]; then info "Running: $cmd"; app_exec "$d" "$cmd" "$dir" "$path" || die "Build command failed"; fi
+}
+
 app_build() {
-  local d type user home app cmd
+  local d type home app
   d=$(resolve_domain "${1:-}" apps) || exit 1
   type=$(site_get "$d" TYPE)
   is_app_type "$type" || die "build is for Node.js and Python apps ($d is a $type site)."
-  user=$(site_get "$d" SITE_USER); home=$(site_get "$d" HOME_DIR); app=$(site_get "$d" APP_DIR)
-  [[ -n $(ls -A "$app" 2>/dev/null) ]] || die "$app is empty — upload your project first (git clone, rsync, SFTP …)."
+  if [[ $(site_get "$d" DEPLOY) == yes ]]; then die "$d deploys from git — run: srv deploy $d"; fi
+  home=$(site_get "$d" HOME_DIR); app=$(site_get "$d" APP_DIR)
+  [[ -n $(ls -A "$app" 2>/dev/null) ]] || die "$app is empty — upload your project first (git clone, rsync, SFTP …), or deploy from git: srv deploy setup $d"
   site_fix_perms "$d" 2>/dev/null
   step "Building $d"
-  if [[ $type == node ]]; then
-    [[ -f $app/package.json ]] || die "No package.json in $app."
-    cmd=$(site_get "$d" INSTALL_CMD)
-    if [[ -z $cmd ]]; then cmd=$(node_install_cmd "$app"); fi
-    info "Installing dependencies: $cmd"
-    app_exec "$d" "$cmd" || die "Dependency install failed (see the output above)"
-    cmd=$(site_get "$d" BUILD_CMD)
-    if [[ -n $cmd ]]; then
-      info "Building: $cmd"
-      app_exec "$d" "$cmd" || die "Build failed (see the output above)"
-    fi
-  else
-    local venv="$home/venv" server pkg
-    if [[ ! -x $venv/bin/python ]]; then
-      info "Creating the virtualenv in $venv"
-      run runuser -u "$user" -- env -C "$home" python3 -m venv "$venv" || die "Couldn't create the virtualenv"
-    fi
-    app_exec "$d" "python -m pip install -q --upgrade pip wheel" || die "pip upgrade failed"
-    if [[ -f $app/requirements.txt ]]; then
-      info "Installing requirements.txt"
-      app_exec "$d" "pip install -r requirements.txt" || die "pip install failed (see the output above)"
-    elif [[ -f $app/pyproject.toml ]]; then
-      info "Installing from pyproject.toml"
-      app_exec "$d" "pip install ." || die "pip install failed (see the output above)"
-    else
-      warn "No requirements.txt or pyproject.toml — skipping dependency install"
-    fi
-    server=$(site_get "$d" PY_SERVER gunicorn)
-    if [[ ! -x $venv/bin/$server ]]; then
-      pkg=gunicorn; if [[ $server == uvicorn ]]; then pkg='uvicorn[standard]'; fi
-      info "Installing $pkg"
-      app_exec "$d" "pip install '$pkg'" || die "Installing $pkg failed"
-    fi
-    if [[ $(site_get "$d" PY_FRAMEWORK) == django && -f $app/manage.py ]]; then
-      info "Collecting static files"
-      app_exec "$d" "python manage.py collectstatic --noinput" || warn "collectstatic failed — check STATIC_ROOT in settings.py"
-    fi
-    cmd=$(site_get "$d" BUILD_CMD)
-    if [[ -n $cmd ]]; then info "Running: $cmd"; app_exec "$d" "$cmd" || die "Build command failed"; fi
-  fi
+  if [[ $type == node ]]; then node_build "$d" "$app" "$(app_path "$d")"
+  else py_build "$d" "$app" "$home/venv"; fi
   site_fix_perms "$d" 2>/dev/null
   ok "Build finished"
   app_start "$d"
@@ -3474,6 +3838,617 @@ cmd_app() {
     exec|run)       app_exec_cmd "$@" ;;
     ""|menu)        menu_apps ;;
     *) die "Unknown app command: $sub (see: srv help)" ;;
+  esac
+}
+
+# =============================================================================
+#  DEPLOY — git releases with an atomic "current" switch
+#
+#  /var/www/<domain>/
+#    repo.git/                 bare mirror of the repository
+#    releases/<id>/            one folder per deploy (id = UTC timestamp)
+#    shared/                   kept between releases (.env, storage/, media/ …)
+#    current -> releases/<id>  what Nginx, PHP-FPM and the app serve
+#
+#  A deploy: fetch → export the commit into a new release → link shared files →
+#  build (composer / npm / pip / collectstatic / your command) → migrations →
+#  switch "current" → reload/restart → health check (rollback if it fails) →
+#  delete old releases. Until the switch, the live site is untouched.
+# =============================================================================
+deploy_enabled() { [[ -n $(site_get "$1" REPO) ]]; }
+deploy_current() {
+  local l; l=$(readlink "$(site_get "$1" HOME_DIR)/current" 2>/dev/null) || return 1
+  [[ -n $l ]] || return 1
+  basename "$l"
+}
+deploy_meta() { printf '%s/releases/%s/%s' "$SRV_DIR" "$1" "$2"; }
+deploy_releases_desc() {
+  find "$(site_get "$1" HOME_DIR)/releases" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -r
+}
+site_has_key() { grep -qE "^$2=" "$(site_file "$1")"; }
+is_ssh_repo()  { [[ $1 =~ ^ssh:// || $1 =~ ^[A-Za-z0-9._-]+@[^:/]+: ]]; }
+valid_repo()   { [[ $1 =~ ^(ssh|https?|git|file)://[^[:space:]]+$ || $1 =~ ^/[^[:space:]]+$ || $1 =~ ^[A-Za-z0-9._-]+@[^:/[:space:]]+:[^[:space:]]+$ ]]; }
+valid_ref()    { [[ $1 =~ ^[A-Za-z0-9._/@^~-]+$ && $1 != -* ]]; }
+
+deploy_ssh_cmd() {
+  local home=$1 c
+  c="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$home/.ssh/known_hosts"
+  if [[ -f $home/.ssh/deploy_key ]]; then c="$c -i $home/.ssh/deploy_key -o IdentitiesOnly=yes"; fi
+  printf '%s' "$c"
+}
+
+deploy_git() {   # deploy_git <domain> <git args…> — runs git as the site user
+  local d=$1; shift
+  local user home; user=$(site_get "$d" SITE_USER); home=$(site_get "$d" HOME_DIR)
+  runuser -u "$user" -- env -i HOME="$home" USER="$user" PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 \
+    GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(deploy_ssh_cmd "$home")" git "$@" 9>&-
+}
+
+# A repository on this server owned by another user: let the site user read it
+deploy_trust_local() {
+  local d=$1 repo=$2 path
+  case $repo in
+    file://*) path=${repo#file://} ;;
+    /*)       path=$repo ;;
+    *)        return 0 ;;
+  esac
+  if ! deploy_git "$d" config --global --get-all safe.directory 2>/dev/null | grep -qxF "$path"; then
+    deploy_git "$d" config --global --add safe.directory "$path" || true
+  fi
+}
+
+deploy_ensure_dirs() {
+  local d=$1 user home; user=$(site_get "$d" SITE_USER); home=$(site_get "$d" HOME_DIR)
+  install -d -m 700 -o "$user" -g "$user" "$home/.ssh"
+  install -d -m 750 -o "$user" -g "$user" "$home/releases" "$home/shared" "$home/logs"
+  install -d -m 700 "$SRV_DIR/releases" "$SRV_DIR/releases/$d"
+}
+
+deploy_key() {
+  local d user home
+  d=$(resolve_domain "${1:-}") || exit 1
+  user=$(site_get "$d" SITE_USER); home=$(site_get "$d" HOME_DIR)
+  install -d -m 700 -o "$user" -g "$user" "$home/.ssh"
+  if [[ ! -f $home/.ssh/deploy_key ]]; then
+    run runuser -u "$user" -- ssh-keygen -q -t ed25519 -N "" -C "srv-deploy-$d@$(hostname -s)" -f "$home/.ssh/deploy_key" \
+      || die "ssh-keygen failed"
+    ok "Deploy key created: $home/.ssh/deploy_key"
+  fi
+  echo
+  echo " Add this public key to the repository as a read-only deploy key:"
+  echo "   GitHub     Settings → Deploy keys → Add deploy key"
+  echo "   GitLab     Settings → Repository → Deploy keys"
+  echo "   Bitbucket  Repository settings → Access keys"
+  echo
+  cat "$home/.ssh/deploy_key.pub"
+  echo
+}
+
+deploy_default_shared() {   # → "dirs|files"
+  case $(site_get "$1" TYPE) in
+    laravel) echo "storage|.env" ;;
+    python)  if [[ $(site_get "$1" PY_FRAMEWORK) == django ]]; then echo "$(site_get "$1" MEDIA_DIR media)|"; else echo "|"; fi ;;
+    *)       echo "|" ;;
+  esac
+}
+
+deploy_setup() {
+  local d="" repo="" branch="" now="" keep="" build="" build_set=0
+  while (( $# )); do
+    case $1 in
+      --repo)      need_val "$@"; repo=$2; shift 2 ;;
+      --branch)    need_val "$@"; branch=$2; shift 2 ;;
+      --keep)      need_val "$@"; keep=$2; shift 2 ;;
+      --build)     need_val "$@"; build=$2; build_set=1; shift 2 ;;
+      --deploy)    now=yes; shift ;;
+      --no-deploy) now=no; shift ;;
+      -*)          die "Unknown option: $1" ;;
+      *)           d=$1; shift ;;
+    esac
+  done
+  d=$(resolve_domain "$d") || exit 1
+  local type user home app
+  type=$(site_get "$d" TYPE); user=$(site_get "$d" SITE_USER); home=$(site_get "$d" HOME_DIR); app=$(site_get "$d" APP_DIR)
+  [[ $type != proxy ]] || die "Proxy sites don't have code to deploy."
+  command -v git >/dev/null 2>&1 || apt_install git || die "git is required"
+
+  while true; do
+    if [[ -z $repo ]]; then repo=$(ui_input "Git repository (git@github.com:you/app.git or https://…)" "$(site_get "$d" REPO)") || die "Cancelled."; fi
+    if valid_repo "$repo"; then break; fi
+    warn "That doesn't look like a git URL: $repo"; retry_or_die "Invalid repository: $repo"; repo=""
+  done
+  if [[ -z $branch ]]; then branch=$(ui_input "Branch to deploy" "$(site_get "$d" BRANCH main)") || die "Cancelled."; fi
+  valid_ref "$branch" || die "Invalid branch name: $branch"
+  if [[ $repo =~ ://[^/@]+:[^/@]+@ ]]; then warn "The URL contains a password/token. It's stored root-only, but a deploy key is safer."; fi
+
+  # Static / SPA: build step (e.g. Vite) and the folder it writes to
+  if [[ $type == static || $type == spa ]] && (( ! build_set )); then
+    build=$(ui_input "Build command for each release (blank = none, e.g. npm ci && npm run build)" "$(site_get "$d" DEPLOY_BUILD)" empty) || die "Cancelled."
+    build_set=1
+    if [[ -n $build && -z $(site_get "$d" WEBROOT) ]]; then
+      local wr; wr=$(ui_input "Folder the build writes to — it becomes the web root (blank = repository root)" "dist" empty) || die "Cancelled."
+      wr=${wr#/}; wr=${wr%/}
+      if [[ -n $wr ]]; then valid_relpath "$wr" || die "Invalid folder: $wr"; site_set "$d" WEBROOT "$wr"; fi
+    fi
+  fi
+  if (( build_set )); then site_set "$d" DEPLOY_BUILD "$build"; fi
+  if is_php_type "$type"; then ensure_feature composer; fi
+
+  deploy_ensure_dirs "$d"
+  if is_ssh_repo "$repo"; then
+    local had_key=0; if [[ -f $home/.ssh/deploy_key ]]; then had_key=1; fi
+    deploy_key "$d"
+    if (( ! had_key && INTERACTIVE && ! ASSUME_YES )); then
+      read -r -p "Add the key to the repository, then press Enter to continue… " _ </dev/tty || true
+    fi
+  fi
+
+  deploy_trust_local "$d" "$repo"
+  info "Checking access to $repo"
+  local out
+  if out=$(deploy_git "$d" ls-remote --heads "$repo" "$branch" 2>&1); then
+    if [[ -n $out ]]; then ok "Repository reachable, branch '$branch' found"
+    else warn "The repository is reachable but has no branch '$branch'."; fi
+  else
+    warn "Couldn't reach the repository:"
+    printf '%s\n' "$out" | tail -n 3 | sed 's/^/     │ /' >&2
+    if is_ssh_repo "$repo"; then warn "Check that the deploy key above is added to the repository."; fi
+  fi
+
+  if [[ -n $(site_get "$d" REPO) && $(site_get "$d" REPO) != "$repo" ]]; then rm -rf "${home:?}/repo.git"; fi
+  site_set "$d" REPO "$repo"
+  site_set "$d" BRANCH "$branch"
+  if [[ -n $keep ]]; then
+    [[ $keep =~ ^[0-9]+$ ]] && (( keep >= 2 && keep <= 50 )) || die "--keep must be 2–50"
+    site_set "$d" DEPLOY_KEEP "$keep"
+  elif ! site_has_key "$d" DEPLOY_KEEP; then site_set "$d" DEPLOY_KEEP 5; fi
+  local sh x; sh=$(deploy_default_shared "$d")
+  site_has_key "$d" DEPLOY_SHARED_DIRS   || site_set "$d" DEPLOY_SHARED_DIRS "${sh%%|*}"
+  site_has_key "$d" DEPLOY_SHARED_FILES  || site_set "$d" DEPLOY_SHARED_FILES "${sh#*|}"
+  site_has_key "$d" DEPLOY_AUTO_ROLLBACK || site_set "$d" DEPLOY_AUTO_ROLLBACK yes
+  site_has_key "$d" DEPLOY_HEALTH_PATH   || site_set "$d" DEPLOY_HEALTH_PATH /
+  if ! site_has_key "$d" DEPLOY_MIGRATE; then
+    if [[ $type == laravel || ( $type == python && $(site_get "$d" PY_FRAMEWORK) == django ) ]]; then site_set "$d" DEPLOY_MIGRATE yes
+    else site_set "$d" DEPLOY_MIGRATE no; fi
+  fi
+
+  # Seed shared/ from files already on the server so the first release keeps them
+  if [[ $(site_get "$d" DEPLOY) != yes ]]; then
+    for x in $(site_get "$d" DEPLOY_SHARED_DIRS); do
+      if [[ -d $app/$x && ! -e $home/shared/$x ]]; then mkdir -p "$(dirname "$home/shared/$x")"; cp -a "$app/$x" "$home/shared/$x"; info "Copied $x/ into shared/"; fi
+    done
+    for x in $(site_get "$d" DEPLOY_SHARED_FILES); do
+      if [[ -f $app/$x && ! -e $home/shared/$x ]]; then mkdir -p "$(dirname "$home/shared/$x")"; cp -a "$app/$x" "$home/shared/$x"; info "Copied $x into shared/"; fi
+    done
+    chown -R "$user:$user" "$home/shared"
+  fi
+  if [[ $(site_get "$d" DEPLOY_WEBHOOK) == yes ]]; then webhook_write_secret "$d"; fi
+
+  ok "Deploys set up for $d: $repo ($branch)"
+  printf '  %-14s %s\n' "Shared dirs" "$(x=$(site_get "$d" DEPLOY_SHARED_DIRS); echo "${x:-none}")" \
+    "Shared files" "$(x=$(site_get "$d" DEPLOY_SHARED_FILES); echo "${x:-none}")" \
+    "Migrations" "$(site_get "$d" DEPLOY_MIGRATE)" "Keep" "$(site_get "$d" DEPLOY_KEEP) releases" >&2
+  info "Change these with e.g.: srv site set $d DEPLOY_SHARED_DIRS \"storage public/uploads\""
+  if [[ -z $now ]]; then if ui_yesno "Deploy '$branch' now?" yes; then now=yes; else now=no; fi; fi
+  if [[ $now == yes ]]; then deploy_now "$d"; else info "Deploy with: srv deploy $d"; fi
+  info "Auto-deploy on every push: srv deploy webhook $d on"
+}
+
+deploy_now() {
+  local d="" ref="" maint=no migrate=""
+  while (( $# )); do
+    case $1 in
+      --ref)         need_val "$@"; ref=$2; shift 2 ;;
+      --maintenance) maint=yes; shift ;;
+      --no-migrate)  migrate=no; shift ;;
+      -*)            die "Unknown option: $1" ;;
+      *)             d=$1; shift ;;
+    esac
+  done
+  d=$(resolve_domain "$d" deploy) || exit 1
+  deploy_enabled "$d" || die "Deploys aren't set up for $d — run: srv deploy setup $d"
+  if [[ -n $ref ]] && ! valid_ref "$ref"; then die "Invalid ref: $ref"; fi
+  if is_php_type "$(site_get "$d" TYPE)"; then ensure_feature composer; fi   # ask now, not mid-deploy
+  migrate=${migrate:-$(site_get "$d" DEPLOY_MIGRATE no)}
+  local user home log rc=0
+  user=$(site_get "$d" SITE_USER); home=$(site_get "$d" HOME_DIR); log="$home/logs/deploy.log"
+  deploy_ensure_dirs "$d"
+  printf '\n===== %s  deploy %s  (%s) =====\n' "$(date '+%F %T')" "${ref:-$(site_get "$d" BRANCH main)}" "${SRV_TRIGGER:-cli}" >>"$log"
+  # The deploy runs in a subshell, so a failure cleans up after itself (EXIT trap)
+  { trap deploy_on_exit EXIT; INTERACTIVE=0; deploy_run "$d" "$ref" "$maint" "$migrate"; } 2>&1 \
+    | tee >(sed -u 's/\x1b\[[0-9;]*m//g' >>"$log") >&2 || rc=$?
+  sleep 0.2
+  chown "$user:$user" "$log" 2>/dev/null || true
+  return "$rc"
+}
+
+deploy_on_exit() {
+  local h; h=$(site_get "$DEPLOY_SITE" HOME_DIR)
+  if (( DEPLOY_MAINT_SET )) && [[ -n $h ]]; then rm -f "${h:?}/.maintenance"; info "Maintenance mode off"; fi
+  if [[ -n $DEPLOY_NEW_REL && $DEPLOY_ACTIVATED == 0 && -d $DEPLOY_NEW_REL ]]; then
+    rm -rf "${DEPLOY_NEW_REL:?}"
+    rm -f "$(deploy_meta "$DEPLOY_SITE" "$(basename "$DEPLOY_NEW_REL")")"
+    err "Deploy failed — the live site was not changed"
+  fi
+}
+
+deploy_run() {
+  local d=$1 ref=$2 maint=$3 migrate=$4
+  local type user home repo branch commit subject rel relp prev started n=2 meta after
+  DEPLOY_SITE=$d; started=$(date +%s)
+  type=$(site_get "$d" TYPE); user=$(site_get "$d" SITE_USER); home=$(site_get "$d" HOME_DIR)
+  repo=$(site_get "$d" REPO); branch=$(site_get "$d" BRANCH main); ref=${ref:-$branch}
+  step "Deploying $d ($ref)"
+
+  deploy_trust_local "$d" "$repo"
+  if [[ ! -d $home/repo.git ]]; then
+    info "Cloning $repo"
+    run deploy_git "$d" clone --mirror --quiet "$repo" "$home/repo.git" || die "git clone failed — check the URL and the deploy key (srv deploy key $d)"
+  else
+    run deploy_git "$d" --git-dir="$home/repo.git" remote set-url origin "$repo"
+    info "Fetching $repo"
+    run deploy_git "$d" --git-dir="$home/repo.git" remote update --prune || die "git fetch failed — check access (srv deploy key $d)"
+  fi
+  commit=$(deploy_git "$d" --git-dir="$home/repo.git" rev-parse --verify --quiet "$ref^{commit}" 2>/dev/null) || die "Branch, tag or commit not found: $ref"
+  subject=$(deploy_git "$d" --git-dir="$home/repo.git" log -1 --format=%s "$commit" 2>/dev/null) || subject=""
+  info "Commit ${commit:0:10} — $subject"
+
+  rel=$(date -u +%Y%m%d%H%M%S)
+  while [[ -e $home/releases/$rel ]]; do rel="$(date -u +%Y%m%d%H%M%S)-$n"; n=$(( n + 1 )); done
+  relp="$home/releases/$rel"; DEPLOY_NEW_REL=$relp
+  run runuser -u "$user" -- mkdir "$relp"
+  deploy_git "$d" --git-dir="$home/repo.git" archive --format=tar "$commit" | runuser -u "$user" -- tar -x -C "$relp" 9>&- \
+    || die "Couldn't export commit $commit"
+  meta=$(deploy_meta "$d" "$rel")
+  printf 'COMMIT=%s\nSUBJECT=%s\nREF=%s\nDATE=%s\nBY=%s\nSTATUS=building\n' \
+    "$commit" "$subject" "$ref" "$(date '+%F %T')" "${SRV_TRIGGER:-cli}" >"$meta"
+  chmod 600 "$meta"
+  ok "Release $rel created"
+
+  deploy_link_shared "$d" "$relp"
+  deploy_build "$d" "$relp"
+
+  if [[ $maint == yes ]]; then touch "$home/.maintenance"; DEPLOY_MAINT_SET=1; info "Maintenance mode on"; fi
+  if [[ $migrate == yes ]]; then deploy_migrate "$d" "$relp"; fi
+
+  prev=$(deploy_current "$d" || true)
+  deploy_switch "$d" "$rel"
+  DEPLOY_ACTIVATED=1
+  kv_set "$meta" STATUS live
+
+  after=$(site_get "$d" DEPLOY_AFTER)
+  if [[ -n $after ]]; then
+    info "After-deploy command: $after"
+    app_exec "$d" "$after" "$home/current" "$(deploy_path "$d" "$relp")" || warn "The after-deploy command failed"
+  fi
+  if (( DEPLOY_MAINT_SET )); then rm -f "${home:?}/.maintenance"; DEPLOY_MAINT_SET=0; info "Maintenance mode off"; fi
+
+  if ! deploy_health "$d"; then
+    kv_set "$meta" STATUS failed
+    if [[ -n $prev && -d $home/releases/$prev && $(site_get "$d" DEPLOY_AUTO_ROLLBACK yes) == yes ]]; then
+      warn "Rolling back to $prev"
+      deploy_switch "$d" "$prev"
+      deploy_health "$d" || true
+      die "Deploy of ${commit:0:10} failed its health check — rolled back to $prev (database migrations are not rolled back)"
+    fi
+    die "Deploy of ${commit:0:10} failed its health check — check: srv site logs $d"
+  fi
+  kv_set "$meta" STATUS ok
+  kv_set "$meta" SECONDS "$(( $(date +%s) - started ))"
+  deploy_cleanup "$d"
+  ok "Deployed $d → ${commit:0:10} (release $rel) in $(( $(date +%s) - started ))s"
+}
+
+deploy_path() {   # PATH for build steps inside a release
+  if [[ $(site_get "$1" TYPE) == python ]]; then app_path "$1" "$2/.venv"; else app_path "$1"; fi
+}
+
+deploy_link_shared() {
+  local d=$1 rel=$2 home user x
+  home=$(site_get "$d" HOME_DIR); user=$(site_get "$d" SITE_USER)
+  for x in $(site_get "$d" DEPLOY_SHARED_DIRS); do
+    valid_relpath "$x" && [[ -n $x && $x != . ]] || die "Invalid shared dir: $x"
+    if [[ ! -e $home/shared/$x ]]; then
+      mkdir -p "$(dirname "$home/shared/$x")"
+      if [[ -d $rel/$x ]]; then cp -a "$rel/$x" "$home/shared/$x"; else mkdir -p "$home/shared/$x"; fi
+      info "shared/$x created"
+    fi
+    rm -rf "${rel:?}/${x:?}"
+    mkdir -p "$(dirname "$rel/$x")"
+    ln -s "$home/shared/$x" "$rel/$x"
+  done
+  for x in $(site_get "$d" DEPLOY_SHARED_FILES); do
+    valid_relpath "$x" && [[ -n $x && $x != . ]] || die "Invalid shared file: $x"
+    if [[ ! -e $home/shared/$x ]]; then
+      mkdir -p "$(dirname "$home/shared/$x")"
+      if [[ -f $rel/$x ]]; then cp -a "$rel/$x" "$home/shared/$x"
+      elif [[ -f $rel/$x.example ]]; then cp -a "$rel/$x.example" "$home/shared/$x"; info "shared/$x created from $x.example"
+      else touch "$home/shared/$x"; fi
+      if [[ $x == .env ]]; then DEPLOY_ENV_CREATED=1; chmod 600 "$home/shared/$x"; fi
+    fi
+    rm -f "${rel:?}/${x:?}"
+    mkdir -p "$(dirname "$rel/$x")"
+    ln -s "$home/shared/$x" "$rel/$x"
+  done
+  if [[ $(site_get "$d" TYPE) == laravel && -d $home/shared/storage ]]; then
+    mkdir -p "$home/shared/storage/"{app/public,framework/cache/data,framework/sessions,framework/views,logs}
+  fi
+  chown -R "$user:$user" "$home/shared"
+  chown -hR "$user:$user" "$rel"
+}
+
+deploy_build() {
+  local d=$1 rel=$2 type php path cmd home
+  type=$(site_get "$d" TYPE); php=$(site_get "$d" PHP); home=$(site_get "$d" HOME_DIR); path=$(deploy_path "$d" "$rel")
+  case $type in
+    php|laravel)
+      if [[ -f $rel/composer.json && $(site_get "$d" DEPLOY_COMPOSER yes) != no ]]; then
+        info "composer install"
+        app_exec "$d" "/usr/bin/php$php /usr/local/bin/composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction --no-progress" "$rel" "$path" \
+          || die "composer install failed"
+      fi
+      if [[ -f $rel/package.json ]] && grep -qE '"build"[[:space:]]*:' "$rel/package.json" && [[ $(site_get "$d" DEPLOY_NPM yes) != no ]]; then
+        if [[ -n $(node_default_bin) ]]; then
+          info "Building front-end assets"
+          app_exec "$d" "$(node_install_cmd "$rel") && npm run build" "$rel" "$path" || die "Front-end build failed"
+        else
+          warn "package.json has a build script but Node.js isn't installed — skipped (srv install node)"
+        fi
+      fi
+      if [[ $type == laravel && -f $rel/artisan ]]; then
+        local envf="$home/shared/.env"
+        if [[ " $(site_get "$d" DEPLOY_SHARED_FILES) " == *" .env "* && -f $envf ]]; then
+          if (( DEPLOY_ENV_CREATED )); then info "New .env — filling in APP_URL, database and Redis"; laravel_env_write "$d" "$envf"; fi
+          if ! grep -qE '^APP_KEY=.+' "$envf"; then
+            app_exec "$d" "/usr/bin/php$php artisan key:generate --force" "$rel" "$path" || warn "key:generate failed"
+          fi
+        fi
+        if [[ -d $rel/public && ! -e $rel/public/storage ]]; then
+          app_exec "$d" "/usr/bin/php$php artisan storage:link" "$rel" "$path" 2>/dev/null || warn "storage:link failed"
+        fi
+        if [[ $(site_get "$d" DEPLOY_OPTIMIZE yes) != no ]]; then
+          info "artisan optimize"
+          app_exec "$d" "/usr/bin/php$php artisan optimize" "$rel" "$path" || warn "artisan optimize failed — continuing without caches"
+        fi
+      fi ;;
+    node)   node_build "$d" "$rel" "$path" ;;
+    python) py_build "$d" "$rel" "$rel/.venv" ;;
+  esac
+  cmd=$(site_get "$d" DEPLOY_BUILD)
+  if [[ -n $cmd ]]; then
+    info "Build command: $cmd"
+    app_exec "$d" "$cmd" "$rel" "$path" || die "Build command failed"
+  fi
+}
+
+deploy_migrate() {
+  local d=$1 rel=$2 path; path=$(deploy_path "$d" "$rel")
+  case $(site_get "$d" TYPE) in
+    laravel)
+      if [[ -f $rel/artisan ]]; then
+        info "artisan migrate --force"
+        app_exec "$d" "/usr/bin/php$(site_get "$d" PHP) artisan migrate --force" "$rel" "$path" || die "Migrations failed — the live release was not changed"
+      fi ;;
+    python)
+      if [[ -f $rel/manage.py ]]; then
+        info "manage.py migrate"
+        app_exec "$d" "python manage.py migrate --noinput" "$rel" "$path" || die "Migrations failed — the live release was not changed"
+      fi ;;
+  esac
+}
+
+# Atomically point "current" at a release, then reload / restart what serves it
+deploy_switch() {
+  local d=$1 rel=$2 user home first=0
+  user=$(site_get "$d" SITE_USER); home=$(site_get "$d" HOME_DIR)
+  [[ -d $home/releases/$rel ]] || die "Release not found: $rel"
+  ln -sfn "releases/$rel" "$home/.current.tmp"
+  mv -Tf "$home/.current.tmp" "$home/current"
+  chown -h "$user:$user" "$home/current"
+  if [[ $(site_get "$d" DEPLOY) != yes || $(site_get "$d" APP_DIR) != "$home/current" ]]; then
+    site_set "$d" DEPLOY yes; site_set "$d" APP_DIR "$home/current"; first=1
+    info "From now on the site is served from $home/current"
+  fi
+  ok "Live: release $rel"
+  deploy_reload "$d" "$first"
+  # Nginx reloads in the background — give the new workers a moment before anyone checks
+  if (( first )); then sleep 2; fi
+}
+
+deploy_reload() {
+  local d=$1 first=$2 type user
+  type=$(site_get "$d" TYPE); user=$(site_get "$d" SITE_USER)
+  if (( first )); then site_apply_nginx "$d" || die "Nginx update failed"; site_render_cron "$d"; fi
+  case $type in
+    php|laravel)
+      run systemctl reload "php$(site_get "$d" PHP)-fpm" || warn "PHP-FPM reload failed"
+      if [[ $type == laravel && -f $(laravel_conf "$d") ]]; then
+        if (( first )); then laravel_render_workers "$d" || warn "Worker config update failed"; fi
+        run supervisorctl restart "srv-$user-laravel:*" || warn "Restarting the Laravel workers failed"
+      fi ;;
+    node|python)
+      app_start "$d" ;;
+  esac
+}
+
+deploy_health() {
+  local d=$1 home path code="" i
+  home=$(site_get "$d" HOME_DIR); path=$(site_get "$d" DEPLOY_HEALTH_PATH /)
+  if [[ -f $home/.maintenance ]]; then info "Maintenance mode is on — health check skipped"; return 0; fi
+  if [[ $(site_get "$d" ENABLED yes) != yes ]]; then info "Site is disabled — health check skipped"; return 0; fi
+  if is_app_type "$(site_get "$d" TYPE)" && ! port_in_use "$(site_get "$d" PORT)"; then app_wait "$d" || return 1; fi
+  for (( i = 0; i < 8; i++ )); do
+    if [[ $(site_get "$d" SSL) == yes ]]; then
+      code=$(curl -s -o /dev/null -w '%{http_code}' -k --noproxy '*' --max-time 15 --resolve "$d:443:127.0.0.1" "https://$d$path" 2>/dev/null) || true
+    else
+      code=$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' --max-time 15 -H "Host: $d" "http://127.0.0.1$path" 2>/dev/null) || true
+    fi
+    if [[ $code =~ ^[1-4][0-9][0-9]$ ]]; then ok "Health check: GET $path → $code"; return 0; fi
+    sleep 2
+  done
+  err "Health check failed: GET $path → ${code:-no response}"
+  return 1
+}
+
+deploy_cleanup() {
+  local d=$1 keep cur home r i=0
+  keep=$(site_get "$d" DEPLOY_KEEP 5); cur=$(deploy_current "$d" || true); home=$(site_get "$d" HOME_DIR)
+  while IFS= read -r r; do
+    [[ -n $r ]] || continue
+    i=$(( i + 1 ))
+    if (( i <= keep )) || [[ $r == "$cur" ]]; then continue; fi
+    rm -rf "${home:?}/releases/${r:?}"
+    rm -f "$(deploy_meta "$d" "$r")"
+    info "Removed old release $r"
+  done < <(deploy_releases_desc "$d")
+}
+
+deploy_releases_list() {
+  local d cur r meta mark any=0
+  d=$(resolve_domain "${1:-}" deploy) || exit 1
+  deploy_enabled "$d" || die "Deploys aren't set up for $d — run: srv deploy setup $d"
+  cur=$(deploy_current "$d" || true)
+  printf '%s  %-18s %-10s %-8s %-19s %s%s\n' "$C_BOLD" RELEASE COMMIT STATUS DATE MESSAGE "$C_0"
+  while IFS= read -r r; do
+    [[ -n $r ]] || continue
+    any=1; meta=$(deploy_meta "$d" "$r"); mark=" "
+    if [[ $r == "$cur" ]]; then mark="*"; fi
+    printf '%s %-18s %-10s %-8s %-19s %s\n' "$mark" "$r" "$(kv_get "$meta" COMMIT | cut -c1-10)" "$(kv_get "$meta" STATUS "?")" \
+      "$(kv_get "$meta" DATE)" "$(kv_get "$meta" SUBJECT | cut -c1-50)"
+  done < <(deploy_releases_desc "$d")
+  if (( any )); then echo "  * = live    repo: $(site_get "$d" REPO) ($(site_get "$d" BRANCH main))"
+  else echo "  (no releases yet — deploy with: srv deploy $d)"; fi
+}
+
+deploy_rollback() {
+  local d=${1:-} target=${2:-} cur r st home meta
+  d=$(resolve_domain "$d" deploy) || exit 1
+  deploy_enabled "$d" || die "Deploys aren't set up for $d."
+  home=$(site_get "$d" HOME_DIR)
+  cur=$(deploy_current "$d") || die "No release is live yet."
+  if [[ -z $target ]]; then
+    if (( INTERACTIVE && ! ASSUME_YES )); then
+      local -a items=()
+      while IFS= read -r r; do
+        [[ -n $r && $r != "$cur" ]] || continue
+        meta=$(deploy_meta "$d" "$r")
+        items+=("$r" "$(kv_get "$meta" COMMIT | cut -c1-8) $(kv_get "$meta" STATUS) $(kv_get "$meta" SUBJECT | cut -c1-40)")
+      done < <(deploy_releases_desc "$d")
+      (( ${#items[@]} )) || die "No other release to roll back to."
+      target=$(ui_menu "Roll back $d" "Live: $cur. Switch to:" "${items[@]}") || die "Cancelled."
+    else
+      while IFS= read -r r; do
+        st=$(kv_get "$(deploy_meta "$d" "$r")" STATUS)
+        if [[ $r < "$cur" && $st != failed && $st != building ]]; then target=$r; break; fi
+      done < <(deploy_releases_desc "$d")
+    fi
+  fi
+  [[ -n $target ]] || die "No earlier working release to roll back to."
+  [[ -d $home/releases/$target ]] || die "Release not found: $target (see: srv deploy releases $d)"
+  [[ $target != "$cur" ]] || die "$target is already live."
+  ui_yesno "Switch $d from $cur to $target? Database migrations are NOT rolled back." yes || die "Cancelled."
+  printf '\n===== %s  rollback %s → %s =====\n' "$(date '+%F %T')" "$cur" "$target" >>"$home/logs/deploy.log"
+  deploy_switch "$d" "$target"
+  deploy_health "$d" || warn "The release you rolled back to fails its health check too — see: srv site logs $d"
+  ok "Rolled back $d to $target"
+}
+
+deploy_log() {
+  local d f
+  d=$(resolve_domain "${1:-}" deploy) || exit 1
+  f="$(site_get "$d" HOME_DIR)/logs/deploy.log"
+  [[ -f $f ]] || die "No deploys yet for $d."
+  if (( MENU_MODE )) || [[ ${2:-} != -f ]]; then tail -n 80 "$f"; else exec tail -n 80 -f "$f"; fi
+}
+
+# ── Webhooks ─────────────────────────────────────────────────────────────────
+webhook_url() { local s=http; if [[ $(site_get "$1" SSL) == yes ]]; then s=https; fi; printf '%s://%s/_srv/deploy' "$s" "$1"; }
+
+webhook_write_secret() {
+  local d=$1 f="$HOOKS_DIR/$1.json" secret
+  secret=$(site_get "$d" WEBHOOK_SECRET)
+  if [[ -z $secret ]]; then secret=$(gen_password 40); site_set "$d" WEBHOOK_SECRET "$secret"; fi
+  install -d -m 750 -o root -g srv-hook "$HOOKS_DIR"
+  printf '{"secret": "%s", "branch": "%s"}\n' "$secret" "$(site_get "$d" BRANCH main)" >"$f"
+  chown root:srv-hook "$f"; chmod 640 "$f"
+}
+
+webhook_show() {
+  local d=$1
+  echo
+  printf '  %-9s %s\n' "URL" "$(webhook_url "$d")" "Secret" "$(site_get "$d" WEBHOOK_SECRET)" \
+    "Branch" "$(site_get "$d" BRANCH main)  (pushes to other branches are ignored)"
+  echo
+  echo "  GitHub     Settings → Webhooks → Add webhook: Payload URL, Content type application/json, Secret, push event"
+  echo "  GitLab     Settings → Webhooks: URL, Secret token, Push events"
+  echo "  Bitbucket  Repository settings → Webhooks: URL, Secret, Repository push"
+  echo "  Other      POST to the URL with the header  X-Srv-Token: <secret>"
+  echo
+  if [[ $(site_get "$d" SSL) != yes ]]; then warn "$d has no HTTPS yet, so the secret travels unencrypted — run: srv ssl add $d"; fi
+}
+
+deploy_webhook() {
+  local d=${1:-} mode=${2:-show}
+  d=$(resolve_domain "$d" deploy) || exit 1
+  deploy_enabled "$d" || die "Set up deploys first: srv deploy setup $d"
+  case $mode in
+    on|enable)
+      ensure_feature webhook
+      webhook_write_secret "$d"
+      site_set "$d" DEPLOY_WEBHOOK yes
+      site_apply_nginx "$d" || die "Nginx update failed"
+      ok "Auto-deploy webhook enabled for $d"
+      webhook_show "$d" ;;
+    off|disable)
+      rm -f "${HOOKS_DIR:?}/${d:?}.json"
+      site_set "$d" DEPLOY_WEBHOOK no
+      site_apply_nginx "$d" || die "Nginx update failed"
+      ok "Webhook disabled for $d" ;;
+    rotate)
+      [[ $(site_get "$d" DEPLOY_WEBHOOK) == yes ]] || die "The webhook is off — enable it with: srv deploy webhook $d on"
+      site_set "$d" WEBHOOK_SECRET ""
+      webhook_write_secret "$d"
+      ok "New webhook secret — update it in your git host"
+      webhook_show "$d" ;;
+    show)
+      [[ $(site_get "$d" DEPLOY_WEBHOOK) == yes ]] || die "The webhook is off — enable it with: srv deploy webhook $d on"
+      webhook_show "$d" ;;
+    *) die "Usage: srv deploy webhook <domain> on|off|show|rotate" ;;
+  esac
+}
+
+# Run deploys queued by the webhook receiver (called by srv-deploy-queue.service)
+deploy_run_queue() {
+  local f d n=0
+  [[ -d $DEPLOY_QUEUE ]] || return 0
+  while (( n < 50 )); do
+    f=$(find "$DEPLOY_QUEUE" -maxdepth 1 -type f -print -quit 2>/dev/null)
+    [[ -n $f ]] || break
+    d=$(basename "$f"); rm -f "${f:?}"; n=$(( n + 1 ))
+    if valid_domain "$d" && site_exists "$d" && [[ $(site_get "$d" DEPLOY_WEBHOOK) == yes ]] && deploy_enabled "$d"; then
+      info "Webhook deploy: $d"
+      SRV_TRIGGER=webhook
+      try deploy_now "$d"
+      if (( TRY_RC != 0 )); then err "Webhook deploy of $d failed (see $(site_get "$d" HOME_DIR)/logs/deploy.log)"; fi
+    else
+      warn "Ignoring a queued deploy for $d (no such site, or its webhook is off)"
+    fi
+  done
+}
+
+cmd_deploy() {
+  local sub=${1:-}
+  case $sub in
+    setup|init)       shift; deploy_setup "$@" ;;
+    key)              shift; deploy_key "${1:-}" ;;
+    webhook|hook)     shift; deploy_webhook "$@" ;;
+    releases|list|ls) shift; deploy_releases_list "${1:-}" ;;
+    rollback)         shift; deploy_rollback "$@" ;;
+    log|logs)         shift; deploy_log "$@" ;;
+    --run-queue)      deploy_run_queue ;;
+    ""|menu)          menu_deploy ;;
+    -*|*.*)           deploy_now "$@" ;;
+    *) die "Unknown deploy command: $sub (see: srv help)" ;;
   esac
 }
 
@@ -3731,26 +4706,448 @@ backup_db() {
 
 backup_list() {
   local f any=0 sub
-  for sub in db pgsql; do
+  for sub in db pgsql files; do
     [[ -d $BACKUP_DIR/$sub ]] || continue
     while IFS= read -r f; do
       [[ -n $f ]] || continue
       any=1; printf '%8s  %s\n' "$(du -h "$f" | cut -f1)" "$f"
-    done < <(find "$BACKUP_DIR/$sub" -type f -name '*.sql.gz' | sort -r)
+    done < <(find "$BACKUP_DIR/$sub" -type f \( -name '*.sql.gz' -o -name '*.tar.gz' \) | sort -r)
   done
-  if (( ! any )); then echo "  (no backups yet — run: srv backup db --all)"; return 0; fi
+  if (( ! any )); then echo "  (no backups yet — run: srv backup run)"; fi
+  if [[ -n $(cfg_get BACKUP_REMOTE) ]]; then echo; echo " Remote copy: $(cfg_get BACKUP_REMOTE) (kept $(cfg_get BACKUP_REMOTE_KEEP 30) days)"; fi
   echo
-  echo " Restore with:"
-  if feat_has database; then echo "   MySQL/MariaDB:  gunzip -c <file> | $(db_client) <database>"; fi
-  if feat_has postgres; then echo "   PostgreSQL:     gunzip -c <file> | runuser -u postgres -- psql -d <database>"; fi
+  echo " Restore:  srv backup restore <domain>          site files + its database"
+  echo "           srv backup restore-db <name> [file]  one database"
+}
+
+# ── Site files ───────────────────────────────────────────────────────────────
+# One archive per site: the code (the live release for git sites), shared/
+# files, app.env, the virtualenv, plus srv's site config and custom Nginx conf.
+backup_one_site() {
+  local d=$1 stamp=$2 home type cur="" tmpd dir out rc=0
+  home=$(site_get "$d" HOME_DIR); type=$(site_get "$d" TYPE)
+  local -a members=()
+  if [[ $(site_get "$d" DEPLOY) == yes ]] && cur=$(deploy_current "$d"); then
+    members+=(shared "releases/$cur")
+  else
+    cur=""
+    if [[ -d $home/app ]]; then members+=(app); fi
+    if [[ -d $home/venv ]]; then members+=(venv); fi
+  fi
+  if [[ -f $home/app.env ]]; then members+=(app.env); fi
+  tmpd=$(mktemp -d "$TMP_DIR/site.XXXXXX")
+  {
+    echo "DOMAIN=$d"
+    echo "TYPE=$type"
+    echo "DEPLOY=$(site_get "$d" DEPLOY no)"
+    echo "RELEASE=$cur"
+    echo "DB_ENGINE=$(site_get "$d" DB_ENGINE mysql)"
+    echo "DB_NAME=$(site_get "$d" DB_NAME)"
+    echo "APP_ACTIVE=$(site_get "$d" APP_ACTIVE no)"
+    echo "CREATED=$(date '+%F %T')"
+    echo "HOST=$(hostname)"
+    echo "SRV_VERSION=$SRV_VERSION"
+  } >"$tmpd/srv-backup.info"
+  cp "$(site_file "$d")" "$tmpd/srv-site.conf"
+  local -a extra=(srv-backup.info srv-site.conf nginx-custom)
+  if [[ -n $cur && -f $(deploy_meta "$d" "$cur") ]]; then cp "$(deploy_meta "$d" "$cur")" "$tmpd/srv-release.meta"; extra+=(srv-release.meta); fi
+  if [[ -d $NGINX_CUSTOM/$d ]]; then cp -a "$NGINX_CUSTOM/$d" "$tmpd/nginx-custom"; else mkdir "$tmpd/nginx-custom"; fi
+  dir="$BACKUP_DIR/files/$d"; install -d -m 700 "$BACKUP_DIR" "$BACKUP_DIR/files" "$dir"
+  out="$dir/$d-$stamp.tar.gz"
+  tar -czf "$out.part" --exclude='node_modules/.cache' --exclude='.next/cache' --exclude='__pycache__' \
+    -C "$home" "${members[@]}" -C "$tmpd" "${extra[@]}" 2>>"$SRV_LOG" || rc=$?
+  # tar exit 1 = "some files changed while reading" — still a usable archive
+  if (( rc > 1 )); then rm -f "${out:?}.part"; err "File backup of $d failed (tar exit $rc) — see $SRV_LOG"; return 1; fi
+  mv -f "$out.part" "$out"; chmod 600 "$out"
+  ok "$d files → $out ($(du -h "$out" | cut -f1))"
+}
+
+backup_site() {   # <domain> | --all
+  local target=${1:---all} d stamp keep failed=0 dir
+  local -a list=()
+  if [[ $target == --all ]]; then mapfile -t list < <(site_list_domains)
+  else d=$(resolve_domain "$target") || exit 1; list=("$d"); fi
+  (( ${#list[@]} )) || { info "No sites to back up."; return 0; }
+  stamp=$(date +%Y%m%d-%H%M%S); keep=$(cfg_get BACKUP_KEEP_DAYS 7)
+  info "Backing up site files — keeping $keep days"
+  for d in "${list[@]}"; do
+    [[ -n $d ]] || continue
+    if [[ $(site_get "$d" TYPE) == proxy ]]; then continue; fi
+    backup_one_site "$d" "$stamp" || failed=1
+    dir="$BACKUP_DIR/files/$d"
+    if [[ -d $dir ]]; then find "$dir" -maxdepth 1 -type f -name '*.tar.gz' -mtime +"$keep" -delete; fi
+  done
+  if (( failed )); then return 1; fi
+}
+
+# What the daily cron job runs: databases, site files, remote copy
+backup_run() {
+  local failed=0
+  info "Backup run started $(date '+%F %T')"
+  if [[ -n $(db_engines) ]]; then try backup_db --all; if (( TRY_RC != 0 )); then failed=1; fi; fi
+  if [[ $(cfg_get BACKUP_FILES no) == yes ]]; then try backup_site --all; if (( TRY_RC != 0 )); then failed=1; fi; fi
+  if [[ -n $(cfg_get BACKUP_REMOTE) ]]; then try remote_push; if (( TRY_RC != 0 )); then failed=1; fi; fi
+  if (( failed )); then err "Backup run finished with errors — see $SRV_LOG"; return 1; fi
+  ok "Backup run finished"
+}
+
+# ── Restore ──────────────────────────────────────────────────────────────────
+backup_pick() {   # dir title glob → chosen file (newest first; non-interactive = newest)
+  local dir=$1 title=$2 glob=$3 f sel
+  local -a items=()
+  [[ -d $dir ]] || return 1
+  while IFS= read -r f; do
+    [[ -n $f ]] || continue
+    items+=("$(basename "$f")" "$(du -h "$f" | cut -f1)  $(date -r "$f" '+%F %T')")
+  done < <(find "$dir" -maxdepth 1 -type f -name "$glob" -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)
+  (( ${#items[@]} )) || return 1
+  if (( ! INTERACTIVE || ASSUME_YES )); then printf '%s/%s' "$dir" "${items[0]}"; return 0; fi
+  sel=$(ui_menu "$title" "Choose a backup (newest first):" "${items[@]}") || return 1
+  printf '%s/%s' "$dir" "$sel"
+}
+
+# db_restore engine name file — replace a database with a dump (a safety dump is taken first)
+db_restore() {
+  local e=$1 n=$2 f=$3 owner safety dir
+  eng_exists "$e" "$n" || die "$(eng_label "$e") database $n doesn't exist — create it first (srv db create $n)"
+  [[ -f $f ]] || die "Not found: $f"
+  gzip -t "$f" 2>/dev/null || die "$f is not a valid .gz file"
+  dir=$(backup_dir_for "$e" "$n"); install -d -m 700 "$dir"
+  safety="$dir/$n-before-restore-$(date +%Y%m%d-%H%M%S).sql.gz"
+  if backup_dump "$e" "$n" "$safety"; then chmod 600 "$safety"; info "Safety copy of the current database: $safety"
+  else rm -f "${safety:?}"; die "Couldn't take a safety dump of $n — not restoring"; fi
+  if [[ $e == pgsql ]]; then
+    owner=$(pg_sql "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname='$n'")
+    eng_drop_db pgsql "$n" || die "Couldn't drop $n"
+    printf 'CREATE DATABASE "%s" OWNER "%s" ENCODING '"'"'UTF8'"'"' TEMPLATE template0;\nREVOKE ALL ON DATABASE "%s" FROM PUBLIC;\n' "$n" "$owner" "$n" \
+      | pg_run >>"$SRV_LOG" 2>&1 || die "Couldn't recreate $n — the safety dump is $safety"
+    gunzip -c "$f" | runuser -u postgres -- env -C / psql -X -q -p "$(pg_port)" -d "$n" >>"$SRV_LOG" 2>&1 \
+      || die "Loading the dump failed — see $SRV_LOG (safety dump: $safety)"
+  else
+    printf 'DROP DATABASE IF EXISTS `%s`;\nCREATE DATABASE `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n' "$n" "$n" \
+      | db_run >>"$SRV_LOG" 2>&1 || die "Couldn't recreate $n — the safety dump is $safety"
+    gunzip -c "$f" | "$(db_client)" --protocol=socket -u root "$n" >>"$SRV_LOG" 2>&1 \
+      || die "Loading the dump failed — see $SRV_LOG (safety dump: $safety)"
+  fi
+  ok "Database $n restored from $(basename "$f")"
+}
+
+backup_restore_db() {
+  local name="" file="" eng="" a d
+  for a in "$@"; do
+    case $a in
+      --pg|--pgsql|--postgres) eng=pgsql ;;
+      --mysql|--mariadb) eng=mysql ;;
+      -*) die "Unknown option: $a" ;;
+      *) if [[ -z $name ]]; then name=$a; else file=$a; fi ;;
+    esac
+  done
+  db_pick_engine "$eng"
+  if [[ -z $name ]]; then
+    (( INTERACTIVE )) || die "Usage: srv backup restore-db <name> [file] [--mysql|--pg]"
+    local -a items=(); local x
+    while IFS= read -r x; do if [[ -n $x ]]; then items+=("$x" "$(site_for_db DB_NAME "$x" "$DB_ENG" || true)"); fi; done < <(eng_databases "$DB_ENG")
+    (( ${#items[@]} )) || die "No databases."
+    name=$(ui_menu "Restore database" "Database to restore:" "${items[@]}") || die "Cancelled."
+  fi
+  valid_db_ident "$name" || die "Invalid database name."
+  if [[ -z $file ]]; then
+    file=$(backup_pick "$(backup_dir_for "$DB_ENG" "$name")" "Restore $name" '*.sql.gz') \
+      || die "No dumps for $name in $(backup_dir_for "$DB_ENG" "$name") (from the remote: srv backup remote pull)"
+  fi
+  if (( INTERACTIVE && ! ASSUME_YES )); then
+    local typed; typed=$(ui_input "Type '$name' to replace it with $(basename "$file")" "") || die "Cancelled."
+    [[ $typed == "$name" ]] || die "Confirmation didn't match — nothing changed."
+  elif (( ! ASSUME_YES )); then
+    die "Refusing to restore without --yes in non-interactive mode."
+  fi
+  db_restore "$DB_ENG" "$name" "$file"
+  if d=$(site_for_db DB_NAME "$name" "$DB_ENG"); then info "Restart $d if it caches data: srv app restart $d"; fi
+}
+
+backup_restore_site() {
+  local d="" archive="" dbmode=""
+  while (( $# )); do
+    case $1 in
+      --file)  need_val "$@"; archive=$2; shift 2 ;;
+      --db)    dbmode=yes; shift ;;
+      --no-db) dbmode=no; shift ;;
+      -*)      die "Unknown option: $1" ;;
+      *)       d=$1; shift ;;
+    esac
+  done
+  d=$(resolve_domain "$d") || exit 1
+  local type user home stamp tmpd info
+  type=$(site_get "$d" TYPE); user=$(site_get "$d" SITE_USER); home=$(site_get "$d" HOME_DIR); stamp=$(date +%Y%m%d-%H%M%S)
+  if [[ -z $archive ]]; then
+    archive=$(backup_pick "$BACKUP_DIR/files/$d" "Restore $d" '*.tar.gz') \
+      || die "No file backups for $d in $BACKUP_DIR/files/$d (from the remote: srv backup remote pull files/$d)"
+  fi
+  [[ -f $archive ]] || die "Not found: $archive"
+  tmpd=$(mktemp -d "$TMP_DIR/restore.XXXXXX")
+  tar -xzf "$archive" -C "$tmpd" --wildcards 'srv-*' 2>/dev/null || die "$archive isn't an srv site backup"
+  info="$tmpd/srv-backup.info"
+  [[ -f $info ]] || die "$archive isn't an srv site backup"
+  local adom atype adeploy arel adbeng adbname
+  adom=$(kv_get "$info" DOMAIN); atype=$(kv_get "$info" TYPE); adeploy=$(kv_get "$info" DEPLOY no)
+  arel=$(kv_get "$info" RELEASE); adbeng=$(kv_get "$info" DB_ENGINE mysql); adbname=$(kv_get "$info" DB_NAME)
+  [[ $atype == "$type" ]] || die "The backup is a $atype site but $d is $type — create the site with --type $atype first."
+  if [[ $adom != "$d" ]]; then warn "This backup is from $adom — restoring it into $d"; fi
+  local -a content=(); mapfile -t content < <(tar -tzf "$archive" 2>/dev/null | sed 's|/.*||' | sort -u)
+  ui_yesno "Restore $d from $(basename "$archive") (made $(kv_get "$info" CREATED))? Current files are moved aside, not deleted." yes || die "Cancelled."
+
+  step "Restoring $d"
+  if is_app_type "$type" && [[ $(site_get "$d" APP_ACTIVE) == yes ]]; then pm_stop "$d" || true; fi
+  if [[ -f $(laravel_conf "$d") ]]; then supervisorctl stop "srv-$user-laravel:*" >>"$SRV_LOG" 2>&1 || true; fi
+  if [[ $(kv_get "$info" APP_ACTIVE) == yes ]]; then site_set "$d" APP_ACTIVE yes; fi
+
+  # 1. Files
+  local m
+  local -a want=()
+  if [[ $adeploy == yes ]]; then
+    [[ -n $arel ]] || die "The backup doesn't name its release."
+    install -d -m 750 -o "$user" -g "$user" "$home/releases"
+    if [[ -e $home/shared ]]; then mv "$home/shared" "$home/shared.before-restore-$stamp"; fi
+    if [[ -e $home/releases/$arel ]]; then mv "$home/releases/$arel" "$home/release-$arel.before-restore-$stamp"; fi
+    want=(shared "releases/$arel")
+  else
+    for m in app venv; do
+      if in_list "$m" "${content[@]}"; then
+        if [[ -e $home/$m ]]; then mv "$home/$m" "$home/$m.before-restore-$stamp"; fi
+        want+=("$m")
+      fi
+    done
+  fi
+  if in_list app.env "${content[@]}"; then
+    if [[ -f $home/app.env ]]; then mv "$home/app.env" "$home/app.env.before-restore-$stamp"; fi
+    want+=(app.env)
+  fi
+  if (( ${#want[@]} )); then tar -xzpf "$archive" -C "$home" "${want[@]}" || die "Extracting $archive failed"; fi
+  if [[ -d $tmpd/nginx-custom ]] && [[ -n $(ls -A "$tmpd/nginx-custom" 2>/dev/null) ]]; then
+    install -d -m 755 "$NGINX_CUSTOM/$d"; cp -a "$tmpd/nginx-custom/." "$NGINX_CUSTOM/$d/"
+  fi
+  chown -R "$user:$user" "$home"
+  ok "Files restored"
+
+  if [[ $adeploy == yes ]]; then
+    if ! deploy_enabled "$d"; then   # e.g. a fresh server: take over the git settings too
+      local k
+      for k in REPO BRANCH DEPLOY_KEEP DEPLOY_SHARED_DIRS DEPLOY_SHARED_FILES DEPLOY_BUILD DEPLOY_AFTER DEPLOY_MIGRATE \
+               DEPLOY_COMPOSER DEPLOY_NPM DEPLOY_OPTIMIZE DEPLOY_HEALTH_PATH DEPLOY_AUTO_ROLLBACK; do
+        if grep -qE "^$k=" "$tmpd/srv-site.conf"; then site_set "$d" "$k" "$(kv_get "$tmpd/srv-site.conf" "$k")"; fi
+      done
+    fi
+    deploy_ensure_dirs "$d"
+    if [[ -f $tmpd/srv-release.meta ]]; then cp "$tmpd/srv-release.meta" "$(deploy_meta "$d" "$arel")"
+    else printf 'SUBJECT=restored from %s\nDATE=%s\nSTATUS=ok\n' "$(basename "$archive")" "$(date '+%F %T')" >"$(deploy_meta "$d" "$arel")"; fi
+    kv_set "$(deploy_meta "$d" "$arel")" BY restore
+  elif [[ $(site_get "$d" DEPLOY) == yes ]]; then
+    site_set "$d" DEPLOY no; site_set "$d" APP_DIR "$home/app"
+  fi
+
+  # 2. Database
+  local dbn eng dump=""
+  dbn=$(site_get "$d" DB_NAME); eng=$(site_get "$d" DB_ENGINE mysql)
+  if [[ -n $dbn && $dbmode != no ]]; then
+    if [[ -n $adbname && $adbeng == "$eng" ]]; then
+      dump=$(INTERACTIVE=0 backup_pick "$(backup_dir_for "$eng" "$adbname")" x "$adbname-[0-9]*.sql.gz" || true)
+    fi
+    if [[ -z $dump ]]; then dump=$(INTERACTIVE=0 backup_pick "$(backup_dir_for "$eng" "$dbn")" x "$dbn-[0-9]*.sql.gz" || true); fi
+    if [[ -n $dump ]]; then
+      if [[ $dbmode == yes ]] || ui_yesno "Also restore database $dbn from $(basename "$dump")?" yes; then db_restore "$eng" "$dbn" "$dump"; fi
+    else
+      warn "No database dump found for ${adbname:-$dbn} — only files were restored (srv backup remote pull fetches remote dumps)"
+    fi
+  fi
+
+  # 3. Point the env files at this server's database / Redis
+  if [[ -n $dbn || $(site_get "$d" REDIS) == yes ]]; then
+    if is_app_type "$type"; then app_env_sync "$d"
+    elif is_php_type "$type"; then
+      local envf
+      if [[ $adeploy == yes ]]; then envf="$home/shared/.env"; else envf="$home/app/.env"; fi
+      if [[ -f $envf ]]; then laravel_env_write "$d" "$envf"; fi
+    fi
+  fi
+
+  # 4. Go live
+  if [[ $adeploy == yes ]]; then
+    deploy_switch "$d" "$arel"
+  else
+    site_rebuild "$d" || warn "Rebuild had problems — check: srv site rebuild $d"
+    if is_app_type "$type" && [[ $(site_get "$d" APP_ACTIVE) == yes ]]; then app_start "$d" || true; fi
+    if is_php_type "$type"; then run systemctl reload "php$(site_get "$d" PHP)-fpm" || true; fi
+  fi
+  if [[ -f $(laravel_conf "$d") ]]; then run supervisorctl start "srv-$user-laravel:*" || true; fi
+  ok "Restored $d from $(basename "$archive")"
+  info "Previous files were kept as *.before-restore-$stamp in $home — delete them once you're happy"
+}
+
+# ── Remote copies (rclone) ───────────────────────────────────────────────────
+rclone_cmd() { rclone --config "$RCLONE_CONF" "$@"; }
+
+rclone_write_section() {   # the lines of the [srv-remote] section
+  local tmp
+  touch "$RCLONE_CONF"; chmod 600 "$RCLONE_CONF"; tmp=$(mktemp)
+  awk 'BEGIN { skip = 0 } /^\[/ { skip = ($0 == "[srv-remote]") } !skip' "$RCLONE_CONF" >"$tmp"
+  { cat "$tmp"; echo "[srv-remote]"; printf '%s\n' "$@"; echo; } >"$RCLONE_CONF"
+  rm -f "${tmp:?}"; chmod 600 "$RCLONE_CONF"
+}
+
+remote_need() { [[ -n $(cfg_get BACKUP_REMOTE) ]] || die "No remote storage configured — run: srv backup remote setup"; }
+
+remote_setup() {
+  local kind="" provider="" akey="" skey="" region="" endpoint="" bucket="" prefix="" keep="" existing="" remote
+  while (( $# )); do
+    case $1 in
+      --existing)   need_val "$@"; existing=$2; shift 2 ;;
+      --type)       need_val "$@"; kind=$2; shift 2 ;;
+      --provider)   need_val "$@"; provider=$2; shift 2 ;;
+      --access-key) need_val "$@"; akey=$2; shift 2 ;;
+      --secret-key) need_val "$@"; skey=$2; shift 2 ;;
+      --region)     need_val "$@"; region=$2; shift 2 ;;
+      --endpoint)   need_val "$@"; endpoint=$2; shift 2 ;;
+      --bucket)     need_val "$@"; bucket=$2; shift 2 ;;
+      --prefix)     need_val "$@"; prefix=$2; shift 2 ;;
+      --keep)       need_val "$@"; keep=$2; shift 2 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+  ensure_feature rclone
+  if [[ -n $existing ]]; then
+    [[ $existing =~ ^[A-Za-z0-9_.-]+:[^[:space:]]*$ ]] || die "Use the form remote:path (a remote defined in $RCLONE_CONF)"
+    remote=$existing
+  else
+    if [[ -z $kind ]]; then
+      kind=$(ui_menu "Remote backups" "Where should backups be copied?" \
+        s3    "Amazon S3 or S3-compatible (Cloudflare R2, Wasabi, DO Spaces, MinIO …)" \
+        b2    "Backblaze B2" \
+        drive "Google Drive (rclone's own setup wizard)" \
+        other "Any other rclone storage (rclone's wizard)") || die "Cancelled."
+    fi
+    case $kind in
+      s3)
+        if [[ -z $provider ]]; then
+          provider=$(ui_menu "S3 provider" "Provider:" AWS "Amazon S3" Cloudflare "Cloudflare R2" Wasabi "Wasabi" \
+            DigitalOcean "DigitalOcean Spaces" Minio "MinIO" Other "Other S3-compatible") || die "Cancelled."
+        fi
+        if [[ -z $akey ]]; then akey=$(ui_input "Access key ID" "") || die "Cancelled."; fi
+        if [[ -z $skey ]]; then
+          (( INTERACTIVE )) || die "--secret-key is required"
+          skey=$(ui_password "Secret access key") || die "Cancelled."
+        fi
+        local rdef=""; case $provider in AWS) rdef=us-east-1 ;; Cloudflare) rdef=auto ;; esac
+        if [[ -z $region ]]; then region=$(ui_input "Region (blank if not needed)" "$rdef" empty) || die "Cancelled."; fi
+        if [[ -z $endpoint && $provider != AWS ]]; then
+          endpoint=$(ui_input "Endpoint URL (e.g. https://<account-id>.r2.cloudflarestorage.com)" "") || die "Cancelled."
+        fi
+        if [[ -z $bucket ]]; then bucket=$(ui_input "Bucket name" "") || die "Cancelled."; fi
+        local -a lines=("type = s3" "provider = $provider" "access_key_id = $akey" "secret_access_key = $skey")
+        if [[ -n $region ]]; then lines+=("region = $region"); fi
+        if [[ -n $endpoint ]]; then lines+=("endpoint = $endpoint"); fi
+        lines+=("acl = private")
+        if [[ $provider == Cloudflare ]]; then lines+=("no_check_bucket = true"); fi
+        rclone_write_section "${lines[@]}" ;;
+      b2)
+        if [[ -z $akey ]]; then akey=$(ui_input "Key ID (account ID or application key ID)" "") || die "Cancelled."; fi
+        if [[ -z $skey ]]; then
+          (( INTERACTIVE )) || die "--secret-key is required"
+          skey=$(ui_password "Application key") || die "Cancelled."
+        fi
+        if [[ -z $bucket ]]; then bucket=$(ui_input "Bucket name" "") || die "Cancelled."; fi
+        rclone_write_section "type = b2" "account = $akey" "key = $skey" ;;
+      drive|other)
+        (( INTERACTIVE )) || die "Google Drive and other storage use rclone's interactive wizard — run this in a terminal."
+        info "rclone's wizard starts now. Create a remote named exactly:  srv-remote"
+        if [[ $kind == drive ]]; then info "Pick 'drive'. On a server without a browser, answer 'n' to auto config and follow the 'rclone authorize' steps."; fi
+        rclone_cmd config </dev/tty >/dev/tty 2>&1 || true
+        grep -qx '\[srv-remote\]' "$RCLONE_CONF" || die "No remote named srv-remote was created."
+        if [[ -z $bucket ]]; then bucket=$(ui_input "Folder or bucket on that storage (blank = top level)" "" empty) || die "Cancelled."; fi ;;
+      *) die "Unknown storage type: $kind (use s3, b2, drive or other)" ;;
+    esac
+    [[ -z $bucket || $bucket =~ ^[A-Za-z0-9._/-]+$ ]] || die "Invalid bucket or folder name: $bucket"
+    if [[ -z $prefix ]]; then prefix=$(ui_input "Folder for this server's backups" "srv-backups/$(hostname -s)") || die "Cancelled."; fi
+    valid_relpath "$prefix" || die "Invalid folder: $prefix"
+    remote="srv-remote:${bucket:+$bucket/}$prefix"
+  fi
+  if [[ -z $keep ]]; then keep=$(ui_input "Keep remote copies for how many days?" "$(cfg_get BACKUP_REMOTE_KEEP 30)") || die "Cancelled."; fi
+  [[ $keep =~ ^[0-9]+$ ]] && (( keep >= 1 )) || die "Days must be 1 or more."
+  local old_remote old_keep; old_remote=$(cfg_get BACKUP_REMOTE); old_keep=$(cfg_get BACKUP_REMOTE_KEEP)
+  cfg_set BACKUP_REMOTE "$remote"; cfg_set BACKUP_REMOTE_KEEP "$keep"
+  if ! remote_test; then
+    cfg_set BACKUP_REMOTE "$old_remote"; cfg_set BACKUP_REMOTE_KEEP "$old_keep"
+    die "The remote storage isn't working — nothing changed. Fix the settings and run: srv backup remote setup"
+  fi
+  ok "Remote backups: $remote (kept $keep days)"
+  if ! feat_has backup; then info "Schedule daily backups with: srv install backup"; fi
+  if [[ -d $BACKUP_DIR ]] && ui_yesno "Upload the existing backups now?" yes; then remote_push; fi
+}
+
+remote_test() {
+  remote_need
+  local r; r=$(cfg_get BACKUP_REMOTE)
+  info "Testing $r"
+  if ! echo "srv test $(date)" | rclone_cmd rcat "$r/.srv-test" >>"$SRV_LOG" 2>&1; then
+    err "Can't write to $r — see $SRV_LOG"; return 1
+  fi
+  rclone_cmd deletefile "$r/.srv-test" >>"$SRV_LOG" 2>&1 || true
+  ok "Remote storage works: $r"
+}
+
+remote_push() {
+  remote_need
+  local r keep; r=$(cfg_get BACKUP_REMOTE); keep=$(cfg_get BACKUP_REMOTE_KEEP 30)
+  [[ -d $BACKUP_DIR ]] || { info "Nothing to upload yet."; return 0; }
+  info "Uploading backups to $r"
+  run rclone_cmd copy "$BACKUP_DIR" "$r" --exclude '*.part' --transfers 4 || { err "Upload failed — see $SRV_LOG"; return 1; }
+  rclone_cmd delete "$r" --min-age "${keep}d" >>"$SRV_LOG" 2>&1 || warn "Removing old remote copies failed"
+  rclone_cmd rmdirs "$r" --leave-root >>"$SRV_LOG" 2>&1 || true
+  ok "Backups uploaded (the remote keeps $keep days)"
+}
+
+remote_pull() {   # [sub-folder, e.g. files/example.com or db/shop]
+  remote_need
+  local sub=${1:-} r; r=$(cfg_get BACKUP_REMOTE)
+  if [[ -n $sub ]]; then sub=${sub#/}; sub=${sub%/}; valid_relpath "$sub" || die "Invalid folder: $sub"; fi
+  info "Downloading $r${sub:+/$sub} → $BACKUP_DIR${sub:+/$sub}"
+  install -d -m 700 "$BACKUP_DIR"
+  run rclone_cmd copy "$r${sub:+/$sub}" "$BACKUP_DIR${sub:+/$sub}" --transfers 4 || die "Download failed — see $SRV_LOG"
+  chmod -R go-rwx "$BACKUP_DIR"
+  ok "Downloaded — restore with: srv backup restore <domain>"
+}
+
+remote_list() {
+  remote_need
+  rclone_cmd lsl "$(cfg_get BACKUP_REMOTE)" 2>>"$SRV_LOG" | sort -k2,3 || die "Listing failed — see $SRV_LOG"
+}
+
+cmd_backup_remote() {
+  local sub=${1:-}; shift || true
+  case $sub in
+    setup)          remote_setup "$@" ;;
+    test)           remote_test ;;
+    push|upload)    remote_push ;;
+    pull|download)  remote_pull "${1:-}" ;;
+    list|ls)        remote_list ;;
+    off|disable)    cfg_set BACKUP_REMOTE ""; ok "Remote copies turned off (nothing was deleted on the remote)" ;;
+    ""|status)
+      if [[ -n $(cfg_get BACKUP_REMOTE) ]]; then echo "Remote: $(cfg_get BACKUP_REMOTE) (kept $(cfg_get BACKUP_REMOTE_KEEP 30) days)"
+      else echo "No remote storage configured — set it up with: srv backup remote setup"; fi ;;
+    *) die "Usage: srv backup remote setup|test|push|pull [folder]|list|off" ;;
+  esac
 }
 
 cmd_backup() {
   local sub=${1:-}; shift || true
   case $sub in
-    db)      backup_db "$@" ;;
-    list|ls) backup_list ;;
-    ""|menu) menu_backup ;;
+    run)          backup_run ;;
+    db)           backup_db "$@" ;;
+    site|files)   backup_site "${1:---all}" ;;
+    list|ls)      backup_list ;;
+    restore)      backup_restore_site "$@" ;;
+    restore-db)   backup_restore_db "$@" ;;
+    remote)       cmd_backup_remote "$@" ;;
+    ""|menu)      menu_backup ;;
     *) die "Unknown backup command: $sub (see: srv help)" ;;
   esac
 }
@@ -3782,6 +5179,7 @@ cmd_status() {
     if [[ -n $v ]]; then printf '  %-13s %s\n' "$f" "$v"
     else printf '  %-13s %s%s%s\n' "$f" "$C_D" "not installed" "$C_0"; fi
   done
+  if [[ -n $(cfg_get BACKUP_REMOTE) ]]; then printf '  %-13s %s\n' "  remote" "$(cfg_get BACKUP_REMOTE) (kept $(cfg_get BACKUP_REMOTE_KEEP 30) days)"; fi
 
   echo; printf '%sServices%s\n' "$C_BOLD" "$C_0"
   if feat_has nginx; then svc_row nginx; fi
@@ -3795,6 +5193,7 @@ cmd_status() {
       printf '  %-26s %s\n' "pm2-$(site_get "$d" SITE_USER)" "$(pm_state "$d") (PM2 for $d)"
     fi
   done < <(site_list_domains)
+  if feat_has webhook; then svc_row srv-webhook; fi
   if feat_has fail2ban; then svc_row fail2ban; fi
   if feat_has certbot; then svc_row certbot.timer; fi
   svc_row cron
@@ -3822,6 +5221,7 @@ main_menu() {
     c=$(ui_menu "srv $SRV_VERSION — $(hostname)" "What would you like to do?" \
       sites   "Sites — add, list, SSL, logs, remove …" \
       apps    "Apps — Node.js / Python processes, Laravel workers" \
+      deploy  "Deploy — git releases, rollback, webhooks" \
       ssl     "SSL certificates" \
       db      "Databases (MySQL/MariaDB, PostgreSQL)" \
       backup  "Backups" \
@@ -3833,6 +5233,7 @@ main_menu() {
       quit)    break ;;
       sites)   try menu_sites; continue ;;
       apps)    try menu_apps; continue ;;
+      deploy)  try menu_deploy; continue ;;
       ssl)     try menu_ssl; continue ;;
       db)      try menu_db; continue ;;
       backup)  try menu_backup; continue ;;
@@ -3854,6 +5255,7 @@ menu_sites() {
       ssl       "Enable HTTPS (Let's Encrypt)" \
       logs      "View recent logs" \
       workers   "Laravel queue workers / Horizon / Reverb" \
+      maintenance "Maintenance mode on/off" \
       redis     "Turn Redis on/off for a site" \
       fix-perms "Fix ownership & permissions" \
       apply-env "Write DB / Redis credentials into .env" \
@@ -3929,19 +5331,68 @@ menu_db() {
   done
 }
 
-menu_backup() {
-  local c
+menu_deploy() {
+  local c d m
   while true; do
-    c=$(ui_menu "Backups" "Database backups:" \
-      now      "Back up all databases now" \
-      list     "List backups" \
-      schedule "Set up daily automatic backups" \
+    c=$(ui_menu "Deploy" "Git deployments:" \
+      now      "Deploy now" \
+      setup    "Set up git deploys for a site (repository, branch)" \
+      releases "List releases" \
+      rollback "Roll back to an earlier release" \
+      webhook  "Auto-deploy on git push (webhook)" \
+      key      "Show the SSH deploy key" \
+      log      "Deploy log" \
       back     "Back") || return 0
     case $c in
-      back)     return 0 ;;
-      now)      try backup_db --all ;;
-      list)     backup_list ;;
-      schedule) try cmd_install backup ;;
+      back)  return 0 ;;
+      setup) try deploy_setup ;;
+      *)
+        if d=$(pick_site deploy); then
+          case $c in
+            now)      try deploy_now "$d" ;;
+            releases) try deploy_releases_list "$d" ;;
+            rollback) try deploy_rollback "$d" ;;
+            key)      try deploy_key "$d" ;;
+            log)      try deploy_log "$d" ;;
+            webhook)
+              if m=$(ui_menu "Webhook: $d" "Auto-deploy webhook:" on "Enable / show URL and secret" off "Disable" rotate "Generate a new secret"); then
+                try deploy_webhook "$d" "$m"
+              fi ;;
+          esac
+        fi ;;
+    esac
+    pause
+  done
+}
+
+menu_backup() {
+  local c m
+  while true; do
+    c=$(ui_menu "Backups" "Backups:" \
+      run        "Back up everything now (databases, files, remote copy)" \
+      db         "Back up databases only" \
+      files      "Back up site files only" \
+      list       "List backups" \
+      restore    "Restore a site (files + database)" \
+      restore-db "Restore one database" \
+      remote     "Remote storage (S3, R2, B2, Google Drive …)" \
+      schedule   "Daily automatic backups" \
+      back       "Back") || return 0
+    case $c in
+      back)       return 0 ;;
+      run)        try backup_run ;;
+      db)         try backup_db --all ;;
+      files)      try backup_site --all ;;
+      list)       backup_list ;;
+      restore)    try backup_restore_site ;;
+      restore-db) try backup_restore_db ;;
+      schedule)   try cmd_install backup ;;
+      remote)
+        if m=$(ui_menu "Remote storage" "$(x=$(cfg_get BACKUP_REMOTE); echo "Now: ${x:-not configured}")" \
+             setup "Set up / change" test "Test the connection" push "Upload backups now" \
+             pull "Download backups from the remote" list "List remote files" off "Turn off"); then
+          try cmd_backup_remote "$m"
+        fi ;;
     esac
     pause
   done
@@ -3967,6 +5418,7 @@ Server
 Sites
   site add [domain] --type static|spa|php|laravel|node|python|proxy  [options]
       common   --aliases "www.example.com"  --db|--no-db  --mysql|--pg  --redis|--no-redis  --ssl|--no-ssl
+               --repo <git url> [--branch main]   deploy from git right away
       PHP      --php 8.4  --webroot public
       Node.js  --node 24  --preset next|nuxt|nest|generic  --start "npm start"  --build "npm run build"
       Python   --framework django|flask|fastapi|other  --server gunicorn|uvicorn  --module main:app  --workers 3
@@ -3974,19 +5426,30 @@ Sites
       proxy    --upstream 127.0.0.1:8080  --websocket|--no-websocket
   site list
   site info <domain> [--secrets]
-  site set <domain> <KEY> <value>   Change a setting (START_CMD, PORT, PHP, UPSTREAM …) and rebuild
+  site set <domain> <KEY> <value>   Change a setting (START_CMD, PORT, PHP, DEPLOY_SHARED_DIRS …)
   site enable|disable <domain>
   site rebuild <domain>|--all  Regenerate Nginx / PHP-FPM / process / cron config
   site fix-perms <domain>      Reset ownership & permissions after uploading files
   site apply-env <domain>      Laravel: APP_URL, DB, Redis, Reverb → .env · apps: DB/Redis → app.env
   site workers <domain> [--queue N] [--horizon|--no-horizon] [--reverb|--no-reverb]
   site redis <domain> on|off
-  site logs <domain> [error|access|php|laravel|app|queue|horizon|reverb]
+  site maintenance <domain> on|off|status [--allow "1.2.3.4 …"]
+  site rollback <domain> [release]
+  site logs <domain> [error|access|php|laravel|app|queue|horizon|reverb|deploy]
   site remove <domain> [--purge]   --purge also deletes files, database and cert
+
+Deploy (git)
+  deploy setup <domain> [--repo URL] [--branch main] [--keep 5] [--no-deploy]
+  deploy <domain> [--ref <branch|tag|commit>] [--maintenance] [--no-migrate]
+  deploy releases <domain>     List releases (* = live)
+  deploy rollback <domain> [release]
+  deploy webhook <domain> on|off|show|rotate   Auto-deploy on push (GitHub, GitLab, Bitbucket)
+  deploy key <domain>          Show / create the SSH deploy key
+  deploy log <domain> [-f]
 
 Apps (Node.js / Python processes, Laravel workers)
   app list
-  app build <domain>           Install dependencies, build, then (re)start
+  app build <domain>           Install dependencies, build, then (re)start (sites without git deploys)
   app start|stop|restart <domain>
   app status <domain>
   app logs <domain> [type]
@@ -4005,8 +5468,13 @@ Databases (add --mysql or --pg when both servers are installed)
   db password <user>           Generate a new password for a database user
 
 Backups
-  backup db [name|--all] [--mysql|--pg]   Dump database(s) to $BACKUP_DIR
+  backup run                   Databases + site files + remote copy (what the daily job runs)
+  backup db [name|--all] [--mysql|--pg]
+  backup site <domain>|--all   Site files
   backup list
+  backup restore <domain> [--file F] [--db|--no-db]
+  backup restore-db <name> [file] [--mysql|--pg]
+  backup remote setup|test|push|pull [folder]|list|off
 
 Options
   -y, --yes    Accept defaults and confirmations (for scripts)
@@ -4051,9 +5519,18 @@ main() {
     app)
       case ${1:-} in list|ls|status|logs|log) ;; *) acquire_lock ;; esac
       cmd_app "$@" ;;
+    deploy)
+      case ${1:-} in
+        releases|list|ls|log|logs|key) ;;
+        --run-queue) acquire_lock 1800 ;;          # webhook deploys wait their turn
+        *) acquire_lock ;;
+      esac
+      cmd_deploy "$@" ;;
     ssl)     acquire_lock; cmd_ssl "$@" ;;
     db)      if [[ ${1:-} != list && ${1:-} != ls ]]; then acquire_lock; fi; cmd_db "$@" ;;
-    backup)  cmd_backup "$@" ;;
+    backup)
+      case ${1:-} in list|ls) ;; run) acquire_lock 3600 ;; *) acquire_lock ;; esac
+      cmd_backup "$@" ;;
     status)  cmd_status ;;
     self-install) self_install ;;
     *) err "Unknown command: $cmd"; echo; usage; exit 1 ;;
