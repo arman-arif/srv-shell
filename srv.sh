@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  srv — single-file server & site manager for Nginx-based web hosting
-#  Version 3.0.0 (Phase 3)
+#  Version 4.0.0 (Phase 4)
 #
 #  What it does
 #    • Setup wizard: system upgrade, timezone, hostname, swap, sudo user,
@@ -20,6 +20,10 @@
 #      webhooks (GitHub / GitLab / Bitbucket), maintenance mode
 #    • Backups: databases + site files, rotation, restore, remote copies
 #      via rclone (S3, R2, B2, Google Drive …)
+#    • Admin: Adminer / phpMyAdmin (secret URL + password + IP allowlist),
+#      health checks with alerts (Telegram, Slack, Discord, webhook), a live
+#      dashboard, several PHP / Node.js / Python versions, per-site cron jobs,
+#      www ↔ non-www redirects, self-update
 #    • Anything skipped during setup can be installed later:  srv install
 #
 #  Supported OS: Ubuntu 22.04+ LTS, Debian 12+
@@ -35,7 +39,7 @@
 set -Eeuo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-SRV_VERSION="3.0.0"
+SRV_VERSION="4.0.0"
 SRV_DIR="/etc/srv"
 SRV_STATE="$SRV_DIR/installed.conf"     # installed features
 SRV_CFG="$SRV_DIR/srv.conf"             # global settings
@@ -58,7 +62,7 @@ PHP_DEFAULT="8.4"
 PHP_OFFERED=(8.4 8.5 8.3 8.2 8.1)
 
 FEATURES=(upgrade timezone hostname swap sudo-user ssh firewall fail2ban auto-updates
-          nginx php composer database postgres redis node python supervisor pm2 certbot backup rclone webhook)
+          nginx php composer database postgres redis node python supervisor pm2 certbot backup rclone webhook dbadmin)
 
 # ── Runtime state ────────────────────────────────────────────────────────────
 INTERACTIVE=0
@@ -75,6 +79,7 @@ MOD_OK=() MOD_FAIL=()
 NODE_LAST_MAJOR=""
 DB_ENG=""
 DEPLOY_SITE="" DEPLOY_NEW_REL="" DEPLOY_ACTIVATED=0 DEPLOY_MAINT_SET=0 DEPLOY_ENV_CREATED=0
+TOOLS_NEW_PASS="" OPT_TOOLS="" OPT_TOOLS_HOST="" OPT_TOOLS_FILE="" OPT_PYVER=""   # OPT_TOOLS_ALLOW: unset = not given
 
 # Answers collected by the ask_* functions, consumed by the mod_* functions
 OPT_TZ="" OPT_HOSTNAME="" OPT_SWAP="" OPT_USER="" OPT_USER_KEYS="no" OPT_USER_PASS=""
@@ -84,6 +89,7 @@ OPT_EMAIL="" OPT_BACKUP_KEEP="" OPT_BACKUP_FILES="" OPT_NODE="" OPT_PG="" OPT_RE
 # Answers collected while adding a site
 S_NODE="" S_PRESET="" S_START="" S_START_SET=0 S_BUILD="" S_BUILD_SET=0 S_PM="" S_PORT=""
 S_FRAMEWORK="" S_SERVER="" S_MODULE="" S_MODULE_SET=0 S_WORKERS="" S_UPSTREAM="" S_WS="" S_PRESERVE=""
+S_PYVER="" S_PYVER_SET=0 S_CANON=""
 
 # ── Output & logging ─────────────────────────────────────────────────────────
 if [[ -t 2 ]]; then
@@ -133,6 +139,13 @@ kv_set() {
   tmp=$(mktemp "$file.XXXXXX")
   grep -vE "^${key}=" "$file" >"$tmp" || true
   printf '%s=%s\n' "$key" "$val" >>"$tmp"
+  chmod 600 "$tmp"; mv -f "$tmp" "$file"
+}
+kv_del() {
+  local file=$1 key=$2 tmp
+  [[ -f $file ]] || return 0
+  tmp=$(mktemp "$file.XXXXXX")
+  grep -vE "^${key}=" "$file" >"$tmp" || true
   chmod 600 "$tmp"; mv -f "$tmp" "$file"
 }
 feat_get() { kv_get "$SRV_STATE" "$1"; }
@@ -427,13 +440,14 @@ feat_desc() {
     backup)       echo "Daily backups — databases + site files, with rotation" ;;
     rclone)       echo "rclone — copy backups to S3, R2, B2, Google Drive …" ;;
     webhook)      echo "Deploy webhook receiver (auto-deploy on git push)" ;;
+    dbadmin)      echo "Adminer / phpMyAdmin behind a secret URL + password" ;;
     *)            echo "$1" ;;
   esac
 }
 
 feat_default() {
   case $1 in
-    hostname|sudo-user|postgres|redis|node|python|supervisor|pm2|rclone|webhook) echo OFF ;;
+    hostname|sudo-user|postgres|redis|node|python|supervisor|pm2|rclone|webhook|dbadmin) echo OFF ;;
     swap) if [[ -n $(swapon --show --noheadings 2>/dev/null) ]]; then echo OFF; else echo ON; fi ;;
     *) echo ON ;;
   esac
@@ -860,14 +874,9 @@ EOF
 EOF
 }
 
-mod_nginx() {
-  step "Installing Nginx"
-  apt_install nginx
-  nginx_write_global
-  nginx_sync_shared
-
-  # Catch-all: unknown hostnames / bare IP get the connection closed
-  rm -f /etc/nginx/sites-enabled/default
+# Catch-all for unknown hostnames / the bare IP: the connection is closed —
+# except the database tools' secret path when they're served on the IP.
+nginx_write_default() {
   {
     echo "# Managed by srv — catch-all for unknown hosts"
     echo "server {"
@@ -875,10 +884,25 @@ mod_nginx() {
     if [[ -f /proc/net/if_inet6 ]]; then echo "    listen [::]:80 default_server;"; fi
     echo "    server_name _;"
     echo "    access_log off;"
-    echo "    return 444;"
+    if [[ $(cfg_get TOOLS_HOST _) == _ && -f $TOOLS_CONF ]] && feat_has dbadmin; then
+      echo "    include $TOOLS_CONF;"
+      echo "    location / { return 444; }"
+    else
+      echo "    return 444;"
+    fi
     echo "}"
   } >/etc/nginx/sites-available/000-srv-default.conf
   ln -sfn /etc/nginx/sites-available/000-srv-default.conf /etc/nginx/sites-enabled/000-srv-default.conf
+}
+
+mod_nginx() {
+  step "Installing Nginx"
+  apt_install nginx
+  nginx_write_global
+  nginx_sync_shared
+
+  rm -f /etc/nginx/sites-enabled/default
+  nginx_write_default
 
   if ! nginx -t >>"$SRV_LOG" 2>&1; then
     warn "Catch-all server conflicts with existing config — removing it"
@@ -1391,7 +1415,8 @@ mod_python() {
   step "Installing Python"
   apt_install python3 python3-venv python3-pip python3-dev build-essential pkg-config \
               libffi-dev libssl-dev libpq-dev default-libmysqlclient-dev
-  feat_set python "$(python3 -V 2>&1 | awk '{print $2}')"
+  if [[ -n $OPT_PYVER ]]; then py_install_version "$OPT_PYVER" || return 1; fi
+  feat_set python "$(python3 -V 2>&1 | awk '{print $2}')$(v=$(py_versions | tr '\n' ' '); [[ -n $v ]] && echo " + ${v% }")"
   ok "Python $(feat_get python) ready (each app gets its own virtualenv)"
 }
 
@@ -1654,6 +1679,8 @@ feature_summary() {
       postgres)  extra="PostgreSQL $OPT_PG" ;;
       redis)     extra="memory policy: $OPT_REDIS_POLICY" ;;
       node)      extra="Node.js $OPT_NODE" ;;
+      python)    extra="${OPT_PYVER:+system + $OPT_PYVER}" ;;
+      dbadmin)   extra="$OPT_TOOLS on ${OPT_TOOLS_HOST/#_/server IP}" ;;
       certbot)   extra=${OPT_EMAIL:-no email} ;;
       backup)    extra="keep $OPT_BACKUP_KEEP days, site files: $OPT_BACKUP_FILES" ;;
       *)         extra="" ;;
@@ -1763,6 +1790,8 @@ cmd_install() {
       redis-server)           f=redis ;;
       ufw)                    f=firewall ;;
       ssl|letsencrypt)        f=certbot ;;
+      adminer|phpmyadmin)     OPT_TOOLS=$f; f=dbadmin ;;
+      tools)                  f=dbadmin ;;
     esac
     in_list "$f" "${FEATURES[@]}" || die "Unknown feature: $f. Available: ${FEATURES[*]}"
     if [[ -n ${1:-} ]]; then
@@ -1770,10 +1799,11 @@ cmd_install() {
         php)      [[ $1 =~ ^[0-9]+\.[0-9]+$ ]] || die "PHP version must look like 8.3"; OPT_PHP=$1 ;;
         node)     [[ $1 =~ ^([0-9]+|lts|latest)$ ]] || die "Node.js version must be a major version (e.g. 22), lts or latest"; OPT_NODE=$1 ;;
         postgres) [[ $1 =~ ^[0-9]+$ ]] || die "PostgreSQL version must be a number (e.g. 17)"; OPT_PG=$1 ;;
+        python)   [[ $1 =~ ^3\.[0-9]+(\.[0-9]+)?$ ]] || die "Python version must look like 3.12"; OPT_PYVER=$1 ;;
         *) die "'$f' doesn't take a version." ;;
       esac
     fi
-    if [[ $f != php && $f != node && $f != upgrade ]] && feat_has "$f"; then
+    if [[ $f != php && $f != node && $f != upgrade ]] && ! [[ $f == python && -n $OPT_PYVER ]] && feat_has "$f"; then
       ui_yesno "'$f' is already installed ($(feat_get "$f")). Run its setup again?" no || { info "Nothing to do."; return 0; }
     fi
     todo=("$f")
@@ -2148,12 +2178,17 @@ site_nginx_extras() {
   {
     echo '    set $srv_maint 0;'
     echo "    if (-f $home/.maintenance) { set \$srv_maint 1; }"
-    echo '    if ($uri ~ ^/(\.well-known/|_srv/deploy$|__srv_maintenance)) { set $srv_maint 0; }'
+    echo '    if ($uri ~ ^/(\.well-known/|_srv/deploy$|__srv_maintenance|_srv-tools-)) { set $srv_maint 0; }'
     for ip in $(site_get "$d" MAINT_ALLOW); do echo "    if (\$remote_addr = $ip) { set \$srv_maint 0; }"; done
     echo '    if ($srv_maint) { rewrite ^ /__srv_maintenance last; }'
     echo '    location = /__srv_maintenance { internal; error_page 503 /__srv_maintenance.html; return 503; }'
     echo "    location = /__srv_maintenance.html { internal; alias $SRV_WWW/maintenance.html; default_type text/html; add_header Retry-After 300 always; add_header Cache-Control \"no-store\" always; }"
   }
+  if [[ $(cfg_get TOOLS_HOST) == "$d" && -f $TOOLS_CONF ]] && feat_has dbadmin; then
+    echo
+    echo "    # Database tools — srv tools"
+    echo "    include $TOOLS_CONF;"
+  fi
   if [[ $(site_get "$d" DEPLOY_WEBHOOK) == yes && -n $(cfg_get WEBHOOK_PORT) ]]; then
     cat <<EOF
 
@@ -2176,6 +2211,7 @@ site_render_nginx() {
   local d=$1 aliases ssl names v6=0 nv h2_listen=" http2" h2_on=0
   aliases=$(site_get "$d" ALIASES); ssl=$(site_get "$d" SSL no)
   names="$d${aliases:+ $aliases}"
+  local canon=0; if [[ -n $aliases && $(site_get "$d" CANONICAL no) == yes ]]; then canon=1; names=$d; fi
   if [[ -f /proc/net/if_inet6 ]]; then v6=1; fi
   if [[ $ssl == yes && ! -f /etc/letsencrypt/live/$d/fullchain.pem ]]; then
     warn "SSL is on for $d but no certificate was found — serving HTTP only"; ssl=no
@@ -2212,6 +2248,33 @@ site_render_nginx() {
   site_nginx_extras "$d"
   site_nginx_body "$d"
   echo "}"
+  if (( canon )); then
+    local target="http://$d"; if [[ $ssl == yes ]]; then target="https://$d"; fi
+    echo
+    echo "# Aliases redirect to the primary domain (CANONICAL=yes)"
+    echo "server {"
+    echo "    listen 80;"
+    if (( v6 )); then echo "    listen [::]:80;"; fi
+    echo "    server_name $aliases;"
+    echo "    include snippets/srv-acme.conf;"
+    echo "    location / {"
+    echo "        return 301 $target\$request_uri;"
+    echo "    }"
+    echo "}"
+    if [[ $ssl == yes ]]; then
+      echo
+      echo "server {"
+      echo "    listen 443 ssl${h2_listen};"
+      if (( v6 )); then echo "    listen [::]:443 ssl${h2_listen};"; fi
+      if (( h2_on )); then echo "    http2 on;"; fi
+      echo "    server_name $aliases;"
+      echo "    ssl_certificate     /etc/letsencrypt/live/$d/fullchain.pem;"
+      echo "    ssl_certificate_key /etc/letsencrypt/live/$d/privkey.pem;"
+      echo "    include snippets/srv-ssl.conf;"
+      echo "    return 301 https://$d\$request_uri;"
+      echo "}"
+    fi
+  fi
 }
 
 # Write + enable the vhost, test it, reload; roll back if Nginx rejects it.
@@ -2367,6 +2430,15 @@ site_ask_node() {
 
 site_ask_python() {
   ensure_feature python
+  local -a pyv=(); mapfile -t pyv < <(py_versions)
+  if (( S_PYVER_SET )); then
+    if [[ -n $S_PYVER && $S_PYVER != system ]]; then in_list "$S_PYVER" "${pyv[@]}" || die "Python $S_PYVER isn't installed (srv python install $S_PYVER)"; else S_PYVER=""; fi
+  elif (( ${#pyv[@]} )); then
+    local -a items=(system "System Python $(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"); local x
+    for x in "${pyv[@]}"; do items+=("$x" "Python $x"); done
+    S_PYVER=$(ui_menu "Python version" "Python for this app:" "${items[@]}") || die "Cancelled."
+    if [[ $S_PYVER == system ]]; then S_PYVER=""; fi
+  fi
   if [[ -z $S_FRAMEWORK ]]; then
     S_FRAMEWORK=$(ui_menu "Python app" "Framework:" \
       django  "Django" \
@@ -2448,6 +2520,7 @@ site_add() {
   local want_db="" want_ssl="" want_redis="" engine="" want_workers=no repo="" branch=""
   S_NODE="" S_PRESET="" S_START="" S_START_SET=0 S_BUILD="" S_BUILD_SET=0 S_PM="" S_PORT=""
   S_FRAMEWORK="" S_SERVER="" S_MODULE="" S_MODULE_SET=0 S_WORKERS="" S_UPSTREAM="" S_WS="" S_PRESERVE=""
+  S_PYVER="" S_PYVER_SET=0 S_CANON=""
   while (( $# )); do
     case $1 in
       --domain)       need_val "$@"; domain=$2; shift 2 ;;
@@ -2462,6 +2535,9 @@ site_add() {
       --pm)           need_val "$@"; S_PM=$2; shift 2 ;;
       --port)         need_val "$@"; S_PORT=$2; shift 2 ;;
       --framework)    need_val "$@"; S_FRAMEWORK=$2; shift 2 ;;
+      --python)       need_val "$@"; S_PYVER=$2; S_PYVER_SET=1; shift 2 ;;
+      --canonical)    S_CANON=yes; shift ;;
+      --no-canonical) S_CANON=no; shift ;;
       --server)       need_val "$@"; S_SERVER=$2; shift 2 ;;
       --module)       need_val "$@"; S_MODULE=$2; S_MODULE_SET=1; shift 2 ;;
       --workers)      need_val "$@"; S_WORKERS=$2; shift 2 ;;
@@ -2516,6 +2592,9 @@ site_add() {
     if owner=$(domain_in_use "$a"); then die "$a is already used by site $owner."; fi
   done
   aliases="${alias_arr[*]}"
+  if [[ -n $aliases && -z $S_CANON ]]; then
+    if ui_yesno "Redirect $aliases to $domain, so the site has one address? (recommended)" yes; then S_CANON=yes; else S_CANON=no; fi
+  fi
 
   # Type
   if [[ -z $type ]]; then
@@ -2688,6 +2767,7 @@ site_add() {
     echo "APP_DIR=$app"
     echo "SSL=no"
     echo "ENABLED=yes"
+    echo "CANONICAL=${S_CANON:-no}"
     case $type in
       static|spa) echo "WEBROOT=$webroot" ;;
       php)        printf '%s\n' "PHP=$php" "WEBROOT=$webroot" ;;
@@ -2696,6 +2776,7 @@ site_add() {
                                 "PORT=$S_PORT" "PM=$S_PM" "APP_ACTIVE=no" "WEBSOCKET=$S_WS" "TIMEOUT=60" ;;
       python)     printf '%s\n' "PY_FRAMEWORK=$S_FRAMEWORK" "PY_SERVER=$S_SERVER" "PY_APP=$S_MODULE" "WORKERS=$S_WORKERS" "BUILD_CMD=" \
                                 "PORT=$S_PORT" "PM=$S_PM" "APP_ACTIVE=no" "WEBSOCKET=$S_WS" "TIMEOUT=60"
+                  echo "PY_VERSION=$S_PYVER"
                   if [[ $S_FRAMEWORK == django ]]; then printf '%s\n' "STATIC_DIR=staticfiles" "MEDIA_DIR=media"; fi ;;
       proxy)      printf '%s\n' "UPSTREAM=$S_UPSTREAM" "PRESERVE_HOST=$S_PRESERVE" "WEBSOCKET=$S_WS" "TIMEOUT=60" ;;
     esac
@@ -2873,6 +2954,7 @@ site_rebuild() {
     info "Rebuilding $d"
     if site_render_pool "$d" && site_apply_nginx "$d"; then
       site_render_cron "$d"
+      cron_render "$d"
       try site_render_processes "$d"
       if (( TRY_RC == 0 )); then ok "$d rebuilt"; else err "$d: process config failed"; failed=1; fi
     else
@@ -2905,11 +2987,12 @@ site_set_cmd() {
     static|spa)  allowed="WEBROOT" ;;
     php|laravel) allowed="WEBROOT PHP" ;;
     node)        allowed="START_CMD BUILD_CMD INSTALL_CMD NODE PORT TIMEOUT WEBSOCKET MAX_BODY" ;;
-    python)      allowed="PY_APP PY_SERVER WORKERS BUILD_CMD PORT TIMEOUT WEBSOCKET MAX_BODY STATIC_DIR MEDIA_DIR" ;;
+    python)      allowed="PY_APP PY_SERVER PY_VERSION WORKERS BUILD_CMD PORT TIMEOUT WEBSOCKET MAX_BODY STATIC_DIR MEDIA_DIR" ;;
     proxy)       allowed="UPSTREAM PRESERVE_HOST TIMEOUT WEBSOCKET MAX_BODY" ;;
   esac
   local deploy_keys="BRANCH DEPLOY_SHARED_DIRS DEPLOY_SHARED_FILES DEPLOY_BUILD DEPLOY_AFTER DEPLOY_KEEP DEPLOY_MIGRATE DEPLOY_COMPOSER DEPLOY_NPM DEPLOY_OPTIMIZE DEPLOY_HEALTH_PATH DEPLOY_AUTO_ROLLBACK"
   if [[ $type != proxy ]]; then allowed="$allowed $deploy_keys"; fi
+  allowed="$allowed CANONICAL"
   # shellcheck disable=SC2086
   in_list "$k" $allowed || die "Editable keys for $type sites: $allowed"
   [[ $v != *$'\n'* ]] || die "The value must be a single line."
@@ -2933,11 +3016,15 @@ site_set_cmd() {
     DEPLOY_KEEP) [[ $v =~ ^[0-9]+$ ]] && (( v >= 2 && v <= 50 )) || die "Keep 2–50 releases" ;;
     DEPLOY_MIGRATE|DEPLOY_COMPOSER|DEPLOY_NPM|DEPLOY_OPTIMIZE|DEPLOY_AUTO_ROLLBACK) in_list "$v" yes no || die "Use yes or no" ;;
     DEPLOY_HEALTH_PATH) [[ $v =~ ^/[^[:space:]]*$ ]] || die "Use a path like / or /health" ;;
+    CANONICAL)   in_list "$v" yes no || die "Use yes or no" ;;
+    PY_VERSION)  if [[ $v == system ]]; then v=""; fi
+                 if [[ -n $v ]]; then mapfile -t _vers < <(py_versions); in_list "$v" "${_vers[@]}" || die "Python $v isn't installed (srv python install $v)"; fi ;;
   esac
   site_set "$d" "$k" "$v"
   ok "$d: $k=$v"
   case $k in
     BRANCH)   if [[ $(site_get "$d" DEPLOY_WEBHOOK) == yes ]]; then webhook_write_secret "$d"; fi ;;
+    PY_VERSION) info "Rebuild the virtualenv to switch: $( [[ $(site_get "$d" DEPLOY) == yes ]] && echo "srv deploy $d" || echo "srv app build $d")" ;;
     DEPLOY_*) ;;   # used by the next deploy — nothing to rebuild
     *)        site_rebuild "$d" ;;
   esac
@@ -3167,7 +3254,11 @@ site_remove() {
     v=${f#/etc/php/}; v=${v%%/*}
     rm -f "$f"; run systemctl reload "php$v-fpm" || true
   done
-  rm -f "/etc/cron.d/srv-$user"
+  rm -f "/etc/cron.d/srv-$user" "/etc/cron.d/srv-$user-jobs" "$(cron_store "$d")"
+  if [[ $(cfg_get TOOLS_HOST) == "$d" ]]; then
+    cfg_set TOOLS_HOST _
+    if feat_has dbadmin; then nginx_write_default && nginx_reload || true; warn "The database tools moved to the server IP — choose a new host: srv tools host <domain>"; fi
+  fi
 
   if [[ $del_db == yes && -n $dbn ]]; then
     if eng_drop_db "$eng" "$dbn"; then
@@ -3603,9 +3694,19 @@ node_build() {   # domain dir PATH
 py_build() {   # domain dir venv
   local d=$1 dir=$2 venv=$3 user path server pkg
   user=$(site_get "$d" SITE_USER); path=$(app_path "$d" "$venv")
+  local py want have; py=$(py_interpreter "$d")
+  want=$("$py" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null) || die "Python interpreter not found: $py"
+  if [[ -x $venv/bin/python ]]; then
+    have=$("$venv/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null) || have=""
+    if [[ $have != "$want" ]]; then
+      info "The virtualenv uses Python ${have:-?}, the app wants $want — recreating it"
+      [[ $venv == */venv || $venv == */.venv ]] || die "Unexpected virtualenv path: $venv"
+      rm -rf "${venv:?}"
+    fi
+  fi
   if [[ ! -x $venv/bin/python ]]; then
-    info "Creating the virtualenv in $venv"
-    run runuser -u "$user" -- env -C "$(site_get "$d" HOME_DIR)" python3 -m venv "$venv" || die "Couldn't create the virtualenv"
+    info "Creating the virtualenv in $venv (Python $want)"
+    run runuser -u "$user" -- env -C "$(site_get "$d" HOME_DIR)" "$py" -m venv "$venv" || die "Couldn't create the virtualenv"
   fi
   app_exec "$d" "python -m pip install -q --upgrade pip wheel" "$dir" "$path" || die "pip upgrade failed"
   if [[ -f $dir/requirements.txt ]]; then
@@ -4059,6 +4160,13 @@ deploy_now() {
     | tee >(sed -u 's/\x1b\[[0-9;]*m//g' >>"$log") >&2 || rc=$?
   sleep 0.2
   chown "$user:$user" "$log" 2>/dev/null || true
+  if [[ $(cfg_get NOTIFY_DEPLOYS yes) == yes ]]; then
+    local cur; cur=$(deploy_current "$d" || true)
+    if (( rc != 0 )); then notify_send "❌ Deploy of $d failed — live release: ${cur:-none}. Log: $log" || true
+    elif [[ ${SRV_TRIGGER:-cli} == webhook ]]; then
+      notify_send "🚀 $d deployed: $(kv_get "$(deploy_meta "$d" "$cur")" COMMIT | cut -c1-8) $(kv_get "$(deploy_meta "$d" "$cur")" SUBJECT)" || true
+    fi
+  fi
   return "$rc"
 }
 
@@ -4258,7 +4366,7 @@ deploy_switch() {
 deploy_reload() {
   local d=$1 first=$2 type user
   type=$(site_get "$d" TYPE); user=$(site_get "$d" SITE_USER)
-  if (( first )); then site_apply_nginx "$d" || die "Nginx update failed"; site_render_cron "$d"; fi
+  if (( first )); then site_apply_nginx "$d" || die "Nginx update failed"; site_render_cron "$d"; cron_render "$d"; fi
   case $type in
     php|laravel)
       run systemctl reload "php$(site_get "$d" PHP)-fpm" || warn "PHP-FPM reload failed"
@@ -4450,6 +4558,1079 @@ cmd_deploy() {
     -*|*.*)           deploy_now "$@" ;;
     *) die "Unknown deploy command: $sub (see: srv help)" ;;
   esac
+}
+
+# =============================================================================
+#  RUNTIMES — several PHP, Node.js and Python versions side by side
+# =============================================================================
+sites_using() {   # KEY VALUE → domains whose KEY equals VALUE
+  local d out=""
+  while IFS= read -r d; do
+    if [[ -n $d && $(site_get "$d" "$1") == "$2" ]]; then out+="$d "; fi
+  done < <(site_list_domains)
+  printf '%s' "${out% }"
+}
+
+# ── PHP ──────────────────────────────────────────────────────────────────────
+php_cmd_list() {
+  local v def any=0
+  def=$(cfg_get PHP_DEFAULT)
+  printf '%s%-8s %-8s %-10s %s%s\n' "$C_BOLD" VERSION DEFAULT FPM SITES "$C_0"
+  for v in $(php_versions); do
+    any=1
+    printf '%-8s %-8s %-10s %s\n' "$v" "$([[ $v == "$def" ]] && echo yes)" "$(svc_state "php$v-fpm")" "$(sites_using PHP "$v")"
+  done
+  if (( ! any )); then echo "  (no PHP installed — srv php install 8.4)"; return 0; fi
+  echo "  CLI 'php' → $(readlink -f /usr/bin/php 2>/dev/null || echo none)"
+}
+
+php_cmd_default() {
+  local v=${1:-}
+  local -a vers=(); mapfile -t vers < <(php_versions)
+  [[ -n $v ]] || die "Usage: srv php default <version>   (installed: ${vers[*]})"
+  in_list "$v" "${vers[@]}" || die "PHP $v isn't installed (installed: ${vers[*]})"
+  cfg_set PHP_DEFAULT "$v"
+  if [[ -x /usr/bin/php$v ]]; then run update-alternatives --set php "/usr/bin/php$v" || warn "Couldn't switch the 'php' command"; fi
+  ok "Default PHP is now $v — used for new sites, the 'php' command and Composer"
+}
+
+php_cmd_remove() {
+  local v=${1:-} used pkgs
+  local -a vers=(); mapfile -t vers < <(php_versions)
+  [[ -n $v ]] || die "Usage: srv php remove <version>"
+  in_list "$v" "${vers[@]}" || die "PHP $v isn't installed."
+  used=$(sites_using PHP "$v")
+  [[ -z $used ]] || die "PHP $v is used by: $used — move them first (srv site set <domain> PHP <other version>)"
+  if [[ $(cfg_get TOOLS_PHP) == "$v" ]] && feat_has dbadmin; then die "The database tools run on PHP $v — reinstall them on another version first."; fi
+  if [[ $v == "$(cfg_get PHP_DEFAULT)" ]] && (( ${#vers[@]} > 1 )); then die "PHP $v is the default — pick another first: srv php default <version>"; fi
+  if (( ! ASSUME_YES )); then ui_yesno "Remove PHP $v and all its extensions?" no || die "Cancelled."; fi
+  pkgs=$(dpkg-query -W -f='${Package} ${Status}\n' "php$v-*" "php$v" 2>/dev/null | awk '$NF == "installed" {print $1}' | tr '\n' ' ') || true
+  [[ -n $pkgs ]] || die "No packages found for PHP $v"
+  # shellcheck disable=SC2086
+  run env DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTS[@]}" -y -q purge $pkgs || die "Removing PHP $v failed — see $SRV_LOG"
+  mapfile -t vers < <(php_versions)
+  if (( ${#vers[@]} )); then feat_set php "${vers[*]}"; else kv_del "$SRV_STATE" php; cfg_set PHP_DEFAULT ""; fi
+  ok "PHP $v removed"
+}
+
+php_cmd_ext() {
+  local ext=${1:-} target=${2:-all} v any=0
+  [[ $ext =~ ^[a-z0-9_-]+$ ]] || die "Usage: srv php ext <name> [version|all]   e.g. srv php ext imagick"
+  local -a vers=()
+  if [[ $target == all ]]; then mapfile -t vers < <(php_versions); else vers=("$target"); fi
+  (( ${#vers[@]} )) || die "No PHP installed."
+  for v in "${vers[@]}"; do
+    [[ -d /etc/php/$v ]] || { warn "PHP $v isn't installed"; continue; }
+    if pkg_installed "php$v-$ext"; then ok "php$v-$ext is already installed"; any=1; continue; fi
+    if pkg_available "php$v-$ext"; then
+      apt_install "php$v-$ext" && run systemctl restart "php$v-fpm" && ok "php$v-$ext installed" && any=1
+    else
+      warn "There's no php$v-$ext package (it may be built in — check: php$v -m)"
+    fi
+  done
+  (( any )) || return 1
+}
+
+# ── Node.js ──────────────────────────────────────────────────────────────────
+node_cmd_list() {
+  local m def any=0
+  def=$(cfg_get NODE_DEFAULT)
+  printf '%s%-7s %-11s %-8s %s%s\n' "$C_BOLD" MAJOR VERSION DEFAULT SITES "$C_0"
+  for m in $(node_versions); do
+    any=1
+    printf '%-7s %-11s %-8s %s\n' "$m" "$(node_full "$m")" "$([[ $m == "$def" ]] && echo yes)" "$(sites_using NODE "$m")"
+  done
+  if (( ! any )); then echo "  (no Node.js installed — srv node install lts)"; fi
+}
+
+node_cmd_default() {
+  local m=${1:-}
+  local -a vers=(); mapfile -t vers < <(node_versions)
+  [[ -n $m ]] || die "Usage: srv node default <major>   (installed: ${vers[*]})"
+  in_list "$m" "${vers[@]}" || die "Node.js $m isn't installed (installed: ${vers[*]})"
+  cfg_set NODE_DEFAULT "$m"
+  node_link_default "$m"
+  feat_set node "$(node_versions | tr '\n' ' ' | sed 's/ $//') (default $m)"
+  ok "Default Node.js is now $m ($(node_full "$m")) — 'node', 'npm', PM2 and PHP/static builds use it"
+  if feat_has pm2; then info "Running PM2 daemons keep the old version until their app restarts (srv app restart <domain>)"; fi
+}
+
+node_cmd_remove() {
+  local m=${1:-} used real
+  local -a vers=(); mapfile -t vers < <(node_versions)
+  [[ -n $m ]] || die "Usage: srv node remove <major>"
+  in_list "$m" "${vers[@]}" || die "Node.js $m isn't installed."
+  used=$(sites_using NODE "$m")
+  [[ -z $used ]] || die "Node.js $m is used by: $used — move them first (srv site set <domain> NODE <other major>)"
+  if [[ $m == "$(cfg_get NODE_DEFAULT)" ]] && (( ${#vers[@]} > 1 )); then die "Node.js $m is the default — pick another first: srv node default <major>"; fi
+  if [[ $m == "$(cfg_get NODE_DEFAULT)" ]] && feat_has pm2; then die "PM2 runs on the default Node.js — remove PM2's apps first."; fi
+  if (( ! ASSUME_YES )); then ui_yesno "Remove Node.js $m ($(node_full "$m"))?" no || die "Cancelled."; fi
+  real=$(readlink -f "$NODE_ROOT/$m")
+  [[ $real == "$NODE_ROOT"/versions/v* ]] || die "Unexpected install path: $real"
+  rm -f "${NODE_ROOT:?}/${m:?}"
+  rm -rf "${real:?}"
+  if [[ $m == "$(cfg_get NODE_DEFAULT)" ]]; then
+    cfg_set NODE_DEFAULT ""
+    local b; for b in node npm npx corepack; do rm -f "/usr/local/bin/${b:?}"; done
+  fi
+  mapfile -t vers < <(node_versions)
+  if (( ${#vers[@]} )); then feat_set node "${vers[*]} (default $(cfg_get NODE_DEFAULT))"; else kv_del "$SRV_STATE" node; fi
+  ok "Node.js $m removed"
+}
+
+node_cmd_upgrade() {   # newest patch release of a major, then restart its apps
+  local m=${1:-} before d n=0
+  local -a vers=(); mapfile -t vers < <(node_versions)
+  [[ -n $m ]] || die "Usage: srv node upgrade <major>"
+  in_list "$m" "${vers[@]}" || die "Node.js $m isn't installed."
+  before=$(node_full "$m")
+  node_install_version "$m" || die "Upgrade failed — see $SRV_LOG"
+  if [[ $(node_full "$m") == "$before" ]]; then ok "Node.js $m is already the newest ($before)"; return 0; fi
+  ok "Node.js $m: $before → $(node_full "$m")"
+  for d in $(sites_using NODE "$m"); do
+    if [[ $(site_get "$d" APP_ACTIVE) == yes ]]; then info "Restarting $d"; try app_restart "$d"; n=$(( n + 1 )); fi
+  done
+  if (( n == 0 )); then info "No running apps use Node.js $m."; fi
+}
+
+# ── Python (extra versions through uv's standalone builds) ───────────────────
+PY_ROOT="$SRV_LIB/python"
+UV_DIR="$SRV_LIB/uv"
+
+py_versions() {
+  local l
+  for l in "$PY_ROOT"/*; do
+    if [[ -L $l && -x $l/bin/python3 ]]; then basename "$l"; fi
+  done | sort -V
+}
+
+py_interpreter() {   # the python a site's virtualenv is built from
+  local v; v=$(site_get "$1" PY_VERSION)
+  if [[ -n $v && -x $PY_ROOT/$v/bin/python3 ]]; then printf '%s/%s/bin/python3' "$PY_ROOT" "$v"; else printf 'python3'; fi
+}
+
+uv_ensure() {
+  if [[ -x $UV_DIR/bin/uv ]]; then return 0; fi
+  info "Installing uv (Python version manager) from PyPI"
+  apt_install python3-venv || return 1
+  run python3 -m venv "$UV_DIR" || return 1
+  run "$UV_DIR/bin/pip" install -q --disable-pip-version-check uv || return 1
+  chmod -R a+rX "$UV_DIR"
+}
+
+py_install_version() {   # 3.12 or 3.12.7
+  local ver=$1 bin dir minor
+  [[ $ver =~ ^3\.[0-9]+(\.[0-9]+)?$ ]] || { err "Python version must look like 3.12 or 3.12.7"; return 1; }
+  uv_ensure || { err "Couldn't install uv"; return 1; }
+  install -d -m 755 "$PY_ROOT" "$PY_ROOT/versions"
+  info "Installing Python $ver (standalone build)"
+  run env UV_PYTHON_INSTALL_DIR="$PY_ROOT/versions" "$UV_DIR/bin/uv" python install "$ver" || return 1
+  bin=$(env UV_PYTHON_INSTALL_DIR="$PY_ROOT/versions" "$UV_DIR/bin/uv" python find --python-preference only-managed "$ver" 2>>"$SRV_LOG") || bin=""
+  [[ -x $bin ]] || { err "uv installed Python $ver but it couldn't be found"; return 1; }
+  dir=$(dirname "$(dirname "$(readlink -f "$bin")")")
+  minor=$("$bin" -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+  chmod -R a+rX "$dir"
+  ln -sfn "$dir" "$PY_ROOT/$minor"
+  ok "Python $("$bin" -c 'import platform; print(platform.python_version())') → $PY_ROOT/$minor"
+}
+
+py_cmd_list() {
+  local v any=0
+  printf '%s%-9s %-12s %s%s\n' "$C_BOLD" VERSION SOURCE SITES "$C_0"
+  local d sys_sites=""
+  while IFS= read -r d; do
+    if [[ -n $d && $(site_get "$d" TYPE) == python && -z $(site_get "$d" PY_VERSION) ]]; then sys_sites+="$d "; fi
+  done < <(site_list_domains)
+  printf '%-9s %-12s %s\n' "$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo -)" system "${sys_sites% }"
+  for v in $(py_versions); do
+    any=1
+    printf '%-9s %-12s %s\n' "$v" "uv" "$(sites_using PY_VERSION "$v")"
+  done
+  if (( ! any )); then echo "  Add versions with: srv python install 3.12"; fi
+}
+
+py_cmd_remove() {
+  local v=${1:-} used real
+  [[ -n $v ]] || die "Usage: srv python remove <version>"
+  [[ -L $PY_ROOT/$v ]] || die "Python $v wasn't installed by srv."
+  used=$(sites_using PY_VERSION "$v")
+  [[ -z $used ]] || die "Python $v is used by: $used — move them first (srv site set <domain> PY_VERSION <other>)"
+  if (( ! ASSUME_YES )); then ui_yesno "Remove Python $v?" no || die "Cancelled."; fi
+  real=$(readlink -f "$PY_ROOT/$v")
+  [[ $real == "$PY_ROOT"/versions/* ]] || die "Unexpected install path: $real"
+  rm -f "${PY_ROOT:?}/${v:?}"
+  rm -rf "${real:?}"
+  ok "Python $v removed"
+}
+
+cmd_php() {
+  local sub=${1:-list}; shift || true
+  case $sub in
+    list|ls)  php_cmd_list ;;
+    install)  [[ -n ${1:-} ]] || die "Usage: srv php install <version>"; cmd_install php "$1" ;;
+    default)  php_cmd_default "${1:-}" ;;
+    remove|uninstall) php_cmd_remove "${1:-}" ;;
+    ext|extension) php_cmd_ext "$@" ;;
+    *) die "Usage: srv php list|install <v>|default <v>|remove <v>|ext <name> [v|all]" ;;
+  esac
+}
+
+cmd_node() {
+  local sub=${1:-list}; shift || true
+  case $sub in
+    list|ls)  node_cmd_list ;;
+    install)  [[ -n ${1:-} ]] || die "Usage: srv node install <major|lts|latest>"; cmd_install node "$1" ;;
+    default)  node_cmd_default "${1:-}" ;;
+    upgrade|update) node_cmd_upgrade "${1:-}" ;;
+    remove|uninstall) node_cmd_remove "${1:-}" ;;
+    *) die "Usage: srv node list|install <major>|default <major>|upgrade <major>|remove <major>" ;;
+  esac
+}
+
+cmd_python() {
+  local sub=${1:-list}; shift || true
+  case $sub in
+    list|ls)  py_cmd_list ;;
+    install)  [[ -n ${1:-} ]] || die "Usage: srv python install <3.x>"; cmd_install python "$1" ;;
+    remove|uninstall) py_cmd_remove "${1:-}" ;;
+    *) die "Usage: srv python list|install <3.x>|remove <3.x>" ;;
+  esac
+}
+
+# =============================================================================
+#  CRON — scheduled commands per site, run as the site user
+# =============================================================================
+cron_store() { printf '%s/cron/%s.jobs' "$SRV_DIR" "$1"; }
+cron_file()  { printf '/etc/cron.d/srv-%s-jobs' "$(site_get "$1" SITE_USER)"; }
+
+valid_schedule() {
+  [[ $1 =~ ^@(reboot|hourly|daily|weekly|monthly|yearly|annually|midnight)$ ]] && return 0
+  local -a f=(); read -ra f <<<"$1"
+  (( ${#f[@]} == 5 )) || return 1
+  local -a lo=(0 0 1 1 0) hi=(59 23 31 12 7) items=() ends=()
+  local i item base step e
+  for (( i = 0; i < 5; i++ )); do
+    IFS=',' read -ra items <<<"${f[i]}"
+    (( ${#items[@]} )) || return 1
+    for item in "${items[@]}"; do
+      base=${item%%/*}; step=""
+      if [[ $item == */* ]]; then step=${item#*/}; [[ $step =~ ^[0-9]+$ ]] && (( 10#$step >= 1 )) || return 1; fi
+      [[ $base == "*" ]] && continue
+      IFS='-' read -ra ends <<<"$base"
+      (( ${#ends[@]} >= 1 && ${#ends[@]} <= 2 )) || return 1
+      for e in "${ends[@]}"; do
+        if [[ $e =~ ^[0-9]+$ ]]; then (( 10#$e >= lo[i] && 10#$e <= hi[i] )) || return 1
+        elif (( i == 3 )) && [[ ${e,,} =~ ^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)$ ]]; then :
+        elif (( i == 4 )) && [[ ${e,,} =~ ^(sun|mon|tue|wed|thu|fri|sat)$ ]]; then :
+        else return 1; fi
+      done
+    done
+  done
+}
+
+cron_render() {
+  local d=$1 store user home app sched cmd
+  store=$(cron_store "$d"); user=$(site_get "$d" SITE_USER); home=$(site_get "$d" HOME_DIR); app=$(site_get "$d" APP_DIR)
+  if [[ ! -s $store ]]; then rm -f "$(cron_file "$d")"; return 0; fi
+  {
+    echo "# Managed by srv — cron jobs for $d (srv cron $d list|add|remove). Output: $home/logs/cron.log"
+    echo "SHELL=/bin/bash"
+    echo "PATH=$(app_path "$d")"
+    while IFS=$'\t' read -r sched cmd; do
+      [[ -n $sched && -n $cmd ]] || continue
+      echo "$sched $user cd $app && ( set -a; [ -f $home/app.env ] && . $home/app.env; set +a; ${cmd//%/\\%} ) >>$home/logs/cron.log 2>&1"
+    done <"$store"
+  } >"$(cron_file "$d")"
+  chmod 644 "$(cron_file "$d")"
+}
+
+cron_list() {
+  local d=$1 store n=0 sched cmd
+  store=$(cron_store "$d")
+  if [[ ! -s $store ]]; then echo "  (no cron jobs for $d — add one: srv cron $d add \"*/5 * * * *\" \"php artisan inspire\")"; return 0; fi
+  printf '%s  #  %-17s %s%s\n' "$C_BOLD" SCHEDULE COMMAND "$C_0"
+  while IFS=$'\t' read -r sched cmd; do
+    n=$(( n + 1 )); printf '  %-2s %-17s %s\n' "$n" "$sched" "$cmd"
+  done <"$store"
+  echo "  Output: $(site_get "$d" HOME_DIR)/logs/cron.log"
+}
+
+cron_add() {
+  local d=$1 sched=${2:-} cmd=${3:-}
+  if [[ -z $sched ]]; then sched=$(ui_input "Schedule (5 cron fields or @daily, e.g. */10 * * * *)" "") || die "Cancelled."; fi
+  valid_schedule "$sched" || die "Invalid schedule: $sched (e.g. \"*/10 * * * *\", \"0 3 * * *\" or @daily)"
+  if [[ -z $cmd ]]; then cmd=$(ui_input "Command (runs in $(site_get "$d" APP_DIR) as $(site_get "$d" SITE_USER))" "") || die "Cancelled."; fi
+  [[ -n $cmd && $cmd != *$'\n'* && $cmd != *$'\t'* ]] || die "The command must be one line."
+  install -d -m 700 "$SRV_DIR/cron"
+  printf '%s\t%s\n' "$sched" "$cmd" >>"$(cron_store "$d")"
+  chmod 600 "$(cron_store "$d")"
+  cron_render "$d"
+  ok "Cron job added for $d: $sched  $cmd"
+}
+
+cron_remove() {
+  local d=$1 n=${2:-} store tmp total
+  store=$(cron_store "$d")
+  [[ -s $store ]] || die "$d has no cron jobs."
+  if [[ -z $n ]]; then
+    (( INTERACTIVE )) || die "Usage: srv cron $d remove <number>  (see: srv cron $d list)"
+    local -a items=(); local i=0 sched cmd
+    while IFS=$'\t' read -r sched cmd; do i=$(( i + 1 )); items+=("$i" "$sched  $cmd"); done <"$store"
+    n=$(ui_menu "Cron: $d" "Remove which job?" "${items[@]}") || die "Cancelled."
+  fi
+  total=$(grep -c . "$store")
+  [[ $n =~ ^[0-9]+$ ]] && (( n >= 1 && n <= total )) || die "No job number $n (see: srv cron $d list)"
+  tmp=$(mktemp); awk -v n="$n" 'NR != n' "$store" >"$tmp"; cat "$tmp" >"$store"; rm -f "${tmp:?}"
+  cron_render "$d"
+  ok "Cron job $n removed"
+}
+
+cron_run_now() {
+  local d=$1 n=${2:-} store sched cmd
+  store=$(cron_store "$d")
+  [[ $n =~ ^[0-9]+$ ]] || die "Usage: srv cron $d run <number>"
+  IFS=$'\t' read -r sched cmd < <(sed -n "${n}p" "$store") || true
+  [[ -n ${cmd:-} ]] || die "No job number $n"
+  info "Running job $n now: $cmd"
+  app_exec "$d" "$cmd"
+}
+
+cmd_cron() {
+  local d=${1:-} sub=${2:-list}
+  d=$(resolve_domain "$d") || exit 1
+  [[ $(site_get "$d" TYPE) != proxy ]] || die "Proxy sites have no code to run."
+  case $sub in
+    list|ls)        cron_list "$d" ;;
+    add)            cron_add "$d" "${3:-}" "${4:-}" ;;
+    remove|rm|del)  cron_remove "$d" "${3:-}" ;;
+    run)            cron_run_now "$d" "${3:-}" ;;
+    *) die "Usage: srv cron <domain> list|add \"<schedule>\" \"<command>\"|remove <n>|run <n>" ;;
+  esac
+}
+
+# =============================================================================
+#  DATABASE TOOLS — Adminer / phpMyAdmin behind a secret URL, a password and
+#  (optionally) an IP allowlist, running in their own PHP-FPM pool as srv-tools
+# =============================================================================
+TOOLS_WEB="$SRV_LIB/tools-web"        # document root: <secret path>/{adminer,phpmyadmin}
+TOOLS_DIR="$SRV_LIB/tools"            # downloaded software
+TOOLS_VAR="/var/lib/srv-tools"        # sessions, temp files
+TOOLS_HTPASSWD="/etc/nginx/srv-tools.htpasswd"
+TOOLS_CONF="/etc/nginx/srv-tools.conf"
+
+tools_url() {
+  local h scheme=http path; h=$(cfg_get TOOLS_HOST _); path=$(cfg_get TOOLS_PATH)
+  if [[ $h == _ ]]; then h=$(hostname -I 2>/dev/null | awk '{print $1}'); h=${h:-<server-ip>}
+  elif [[ $(site_get "$h" SSL) == yes ]]; then scheme=https; fi
+  printf '%s://%s/%s/' "$scheme" "$h" "$path"
+}
+
+ask_dbadmin() {
+  if [[ -z $OPT_TOOLS ]]; then
+    OPT_TOOLS=$(ui_menu "Database tools" "Which web database tool?" \
+      adminer    "Adminer — one file, MySQL/MariaDB + PostgreSQL (recommended)" \
+      phpmyadmin "phpMyAdmin — MySQL/MariaDB" \
+      both       "Both") || die "Cancelled."
+  fi
+  if [[ -z $OPT_TOOLS_HOST ]]; then
+    local -a items=(); local d
+    while IFS= read -r d; do
+      if [[ -n $d ]]; then items+=("$d" "$(site_get "$d" TYPE)$([[ $(site_get "$d" SSL) == yes ]] && echo ", https")"); fi
+    done < <(site_list_domains)
+    items+=(_ "The server's IP address (plain HTTP — use only with an IP allowlist)")
+    OPT_TOOLS_HOST=$(ui_menu "Database tools" "Serve the tools under which address? (a secret path is added)" "${items[@]}") || die "Cancelled."
+  fi
+  if [[ -z ${OPT_TOOLS_ALLOW+x} ]]; then
+    OPT_TOOLS_ALLOW=$(ui_input "Only allow these IP addresses/ranges (space-separated, blank = any, e.g. 203.0.113.7 10.0.0.0/8)" "$(cfg_get TOOLS_ALLOW)" empty) || die "Cancelled."
+  fi
+}
+
+tools_install_adminer() {
+  local aurl="" afile="$TMP_DIR/adminer.php" ver=""
+  aurl=$(curl -fsSL --max-time 20 https://api.github.com/repos/vrana/adminer/releases/latest 2>/dev/null \
+        | grep -oE '"browser_download_url": *"[^"]+/adminer-[0-9.]+\.php"' | head -n 1 | sed -E 's/.*"(https[^"]+)"$/\1/') || url=""
+  if [[ -n $aurl ]] && run curl -fsSL -o "$afile" "$aurl"; then
+    ver=$(basename "$aurl" .php); ver=${ver#adminer-}
+  else
+    warn "Couldn't download the latest Adminer from GitHub — using the distro package instead"
+    apt_install adminer || return 1
+    afile=/usr/share/adminer/adminer.php
+    if [[ ! -f $afile ]]; then afile=$(find /usr/share/adminer -maxdepth 2 -type f -name adminer.php -print -quit 2>/dev/null); fi
+    [[ -n $afile ]] || { err "The adminer package has no adminer.php"; return 1; }
+    ver="$(dpkg-query -W -f='${Version}' adminer 2>/dev/null) (distro)"
+  fi
+  "/usr/bin/php$(cfg_get TOOLS_PHP)" -l "$afile" >/dev/null 2>&1 || { err "The Adminer file doesn't look like valid PHP"; return 1; }
+  install -m 644 "$afile" "$TOOLS_DIR/adminer.php"
+  cfg_set TOOLS_ADMINER "$ver"
+  ok "Adminer $ver installed"
+}
+
+tools_install_pma() {   # [tarball] — latest from phpmyadmin.net, or a local file
+  local file=${1:-} ver url tb="$TMP_DIR/pma.tar.gz" sum new="$TOOLS_DIR/phpmyadmin.new"
+  if [[ -n $file ]]; then
+    [[ -f $file ]] || { err "Not found: $file"; return 1; }
+    cp "$file" "$tb"; ver="(from $(basename "$file"))"
+  else
+    ver=$(curl -fsSL --max-time 20 https://www.phpmyadmin.net/home_page/version.txt 2>/dev/null | head -n 1) || ver=""
+    [[ $ver =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { err "Couldn't get the latest phpMyAdmin version (offline? install from a file: srv tools install phpmyadmin --file phpMyAdmin-x.y.z-all-languages.tar.gz)"; return 1; }
+    url="https://files.phpmyadmin.net/phpMyAdmin/$ver/phpMyAdmin-$ver-all-languages.tar.gz"
+    run curl -fsSL -o "$tb" "$url" || return 1
+    sum=$(curl -fsSL "$url.sha256" 2>/dev/null | awk '{print $1}') || sum=""
+    [[ -n $sum && $(sha256sum "$tb" | awk '{print $1}') == "$sum" ]] || { err "phpMyAdmin checksum mismatch — aborting"; return 1; }
+  fi
+  rm -rf "${new:?}"; mkdir -p "$new"
+  tar -xzf "$tb" -C "$new" --strip-components=1 --no-same-owner || { err "Couldn't unpack phpMyAdmin"; return 1; }
+  [[ -f $new/index.php ]] || { err "That archive doesn't contain phpMyAdmin"; return 1; }
+  local secret; secret=$(cfg_get TOOLS_PMA_SECRET); if [[ -z $secret ]]; then secret=$(gen_password 32); cfg_set TOOLS_PMA_SECRET "$secret"; fi
+  cat >"$new/config.inc.php" <<EOF
+<?php
+// Managed by srv — regenerated by 'srv tools update'
+\$cfg['blowfish_secret'] = '$secret';
+\$i = 1;
+\$cfg['Servers'][\$i]['auth_type'] = 'cookie';
+\$cfg['Servers'][\$i]['host'] = 'localhost';
+\$cfg['Servers'][\$i]['AllowNoPassword'] = false;
+\$cfg['TempDir'] = '$TOOLS_VAR/tmp';
+\$cfg['UploadDir'] = '';
+\$cfg['SaveDir'] = '';
+\$cfg['VersionCheck'] = false;
+EOF
+  chown -R root:root "$new"; chmod -R a+rX,go-w "$new"
+  chown root:srv-tools "$new/config.inc.php"; chmod 640 "$new/config.inc.php"
+  rm -rf "${TOOLS_DIR:?}/phpmyadmin"; mv "$new" "$TOOLS_DIR/phpmyadmin"
+  if [[ $ver != \(* ]]; then cfg_set TOOLS_PMA "$ver"; else cfg_set TOOLS_PMA "installed $ver"; fi
+  ok "phpMyAdmin $ver installed"
+}
+
+tools_render() {   # web folder, PHP pool and the Nginx location
+  local path php allow ip
+  path=$(cfg_get TOOLS_PATH); php=$(cfg_get TOOLS_PHP); allow=$(cfg_get TOOLS_ALLOW)
+  # Web folder — only the secret path exists, so nothing else is reachable
+  install -d -m 755 "$TOOLS_WEB"
+  find "$TOOLS_WEB" -mindepth 1 -maxdepth 1 -name '_srv-tools-*' ! -name "$path" -exec rm -rf {} + 2>/dev/null || true
+  install -d -m 755 "$TOOLS_WEB/$path"
+  local links=""
+  if [[ -f $TOOLS_DIR/adminer.php ]]; then
+    install -d -m 755 "$TOOLS_WEB/$path/adminer"
+    ln -sfn "$TOOLS_DIR/adminer.php" "$TOOLS_WEB/$path/adminer/index.php"
+    links+='<li><a href="adminer/">Adminer</a> — MySQL/MariaDB and PostgreSQL</li>'
+  else
+    rm -rf "${TOOLS_WEB:?}/${path:?}/adminer"
+  fi
+  if [[ -d $TOOLS_DIR/phpmyadmin ]]; then
+    ln -sfn "$TOOLS_DIR/phpmyadmin" "$TOOLS_WEB/$path/phpmyadmin"
+    links+='<li><a href="phpmyadmin/">phpMyAdmin</a> — MySQL/MariaDB</li>'
+  else
+    rm -f "${TOOLS_WEB:?}/${path:?}/phpmyadmin"
+  fi
+  cat >"$TOOLS_WEB/$path/index.php" <<EOF
+<?php header('X-Robots-Tag: noindex'); ?><!doctype html><html><head><meta charset="utf-8"><title>Database tools</title>
+<style>body{font-family:system-ui,sans-serif;margin:3rem;line-height:1.6}</style></head>
+<body><h1>Database tools</h1><ul>$links</ul><p>Log in with a database user and password (create an admin login with: srv tools db-user).</p></body></html>
+EOF
+  chmod 644 "$TOOLS_WEB/$path/index.php"
+
+  # PHP-FPM pool, isolated from the sites
+  local f
+  for f in /etc/php/*/fpm/pool.d/srv-tools.conf; do
+    if [[ -f $f && $f != "/etc/php/$php/fpm/pool.d/srv-tools.conf" ]]; then rm -f "$f"; local ov=${f#/etc/php/}; ov=${ov%%/*}; run systemctl reload "php$ov-fpm" || true; fi
+  done
+  cat >"/etc/php/$php/fpm/pool.d/srv-tools.conf" <<EOF
+; Managed by srv — Adminer / phpMyAdmin (srv tools)
+[srv-tools]
+user = srv-tools
+group = srv-tools
+listen = /run/php/srv-tools.sock
+listen.owner = www-data
+listen.group = www-data
+listen.mode = 0660
+pm = ondemand
+pm.max_children = 4
+pm.process_idle_timeout = 60s
+chdir = /
+php_admin_value[open_basedir] = $TOOLS_WEB:$TOOLS_DIR:$TOOLS_VAR:/tmp
+php_admin_value[session.save_path] = $TOOLS_VAR/sessions
+php_admin_value[upload_tmp_dir] = $TOOLS_VAR/tmp
+php_admin_value[upload_max_filesize] = 256M
+php_admin_value[post_max_size] = 256M
+php_admin_value[memory_limit] = 512M
+php_admin_value[max_execution_time] = 300
+php_admin_flag[expose_php] = off
+EOF
+  "/usr/sbin/php-fpm$php" -t >>"$SRV_LOG" 2>&1 || { err "PHP-FPM rejected the tools pool — see $SRV_LOG"; return 1; }
+  run systemctl reload "php$php-fpm" || return 1
+
+  # Nginx location (included by the host site, or by the default server)
+  {
+    echo "# Managed by srv — database tools (srv tools). Don't edit; use srv tools allow|password|host."
+    echo "location ^~ /$path/ {"
+    echo "    root $TOOLS_WEB;"
+    echo "    index index.php;"
+    echo "    auth_basic \"Restricted\";"
+    echo "    auth_basic_user_file $TOOLS_HTPASSWD;"
+    if [[ -n $allow ]]; then
+      for ip in $allow; do echo "    allow $ip;"; done
+      echo "    deny all;"
+    fi
+    echo "    client_max_body_size 256m;"
+    echo "    access_log /var/log/nginx/srv-tools.access.log;"
+    echo "    add_header X-Robots-Tag \"noindex, nofollow\" always;"
+    echo "    add_header X-Frame-Options \"SAMEORIGIN\" always;"
+    echo "    add_header X-Content-Type-Options \"nosniff\" always;"
+    echo "    location ~ \\.php\$ {"
+    echo "        try_files \$uri =404;"
+    echo "        fastcgi_pass unix:/run/php/srv-tools.sock;"
+    echo "        include fastcgi_params;"
+    echo "        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;"
+    echo "        fastcgi_param HTTP_PROXY \"\";"
+    echo "        fastcgi_read_timeout 300s;"
+    echo "    }"
+    echo "}"
+  } >"$TOOLS_CONF"
+}
+
+# Re-render whichever server{} includes the tools (a site, or the default server)
+tools_apply_host() {
+  local h; h=$(cfg_get TOOLS_HOST _)
+  if [[ $h == _ ]]; then nginx_write_default && nginx_reload
+  else site_exists "$h" || { warn "Tools host $h no longer exists — moving the tools to the server IP"; cfg_set TOOLS_HOST _; nginx_write_default && nginx_reload; return; }
+    site_apply_nginx "$h"
+  fi
+}
+
+tools_set_password() {
+  local user pass hash
+  user=$(cfg_get TOOLS_USER admin); pass=$(gen_password 20)
+  hash=$(openssl passwd -6 "$pass") || { err "openssl passwd failed"; return 1; }
+  printf '%s:%s\n' "$user" "$hash" >"$TOOLS_HTPASSWD"
+  chown root:www-data "$TOOLS_HTPASSWD"; chmod 640 "$TOOLS_HTPASSWD"
+  TOOLS_NEW_PASS=$pass
+}
+
+mod_dbadmin() {
+  step "Installing the database tools"
+  local -a vers=(); mapfile -t vers < <(php_versions)
+  (( ${#vers[@]} )) || { err "PHP is required — run: srv install php"; return 1; }
+  local php; php=$(cfg_get TOOLS_PHP); if [[ -z $php || ! -d /etc/php/$php ]]; then php=$(cfg_get PHP_DEFAULT "${vers[-1]}"); fi
+  in_list "$php" "${vers[@]}" || php=${vers[-1]}
+  cfg_set TOOLS_PHP "$php"
+  local ext; for ext in mysql pgsql mbstring xml zip; do
+    if ! pkg_installed "php$php-$ext" && pkg_available "php$php-$ext"; then apt_install "php$php-$ext" || true; fi
+  done
+  if ! id srv-tools &>/dev/null; then
+    run useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin srv-tools || return 1
+  fi
+  install -d -m 755 "$TOOLS_DIR"
+  install -d -m 700 -o srv-tools -g srv-tools "$TOOLS_VAR" "$TOOLS_VAR/tmp" "$TOOLS_VAR/sessions"
+  local want=${OPT_TOOLS:-adminer} failed=0
+  if [[ $want == adminer || $want == both ]]; then tools_install_adminer || failed=1; fi
+  if [[ $want == phpmyadmin || $want == both ]]; then tools_install_pma "${OPT_TOOLS_FILE:-}" || failed=1; fi
+  if [[ ! -f $TOOLS_DIR/adminer.php && ! -d $TOOLS_DIR/phpmyadmin ]]; then err "No database tool could be installed"; return 1; fi
+  if [[ -z $(cfg_get TOOLS_PATH) ]]; then cfg_set TOOLS_PATH "_srv-tools-$(openssl rand -hex 10)"; fi
+  cfg_set TOOLS_HOST "${OPT_TOOLS_HOST:-$(cfg_get TOOLS_HOST _)}"
+  if [[ -n ${OPT_TOOLS_ALLOW+x} ]]; then cfg_set TOOLS_ALLOW "$OPT_TOOLS_ALLOW"; fi
+  local ip; for ip in $(cfg_get TOOLS_ALLOW); do [[ $ip =~ ^[0-9A-Fa-f:./]+$ ]] || { err "Invalid IP or range: $ip"; return 1; }; done
+  TOOLS_NEW_PASS=""
+  if [[ ! -s $TOOLS_HTPASSWD ]]; then tools_set_password || return 1; fi
+  tools_render || return 1
+  tools_apply_host || return 1
+  feat_set dbadmin "$( [[ -f $TOOLS_DIR/adminer.php ]] && echo adminer)$( [[ -d $TOOLS_DIR/phpmyadmin ]] && echo " phpmyadmin") on $(cfg_get TOOLS_HOST _)"
+  ok "Database tools ready"
+  tools_show
+  if (( failed )); then warn "Some tools failed to install — see above"; fi
+}
+
+tools_show() {
+  feat_has dbadmin || { echo "Database tools aren't installed — run: srv tools install"; return 0; }
+  echo
+  printf '  %-12s %s\n' "URL" "$(tools_url)" "Login" "$(cfg_get TOOLS_USER admin)  $( [[ -n ${TOOLS_NEW_PASS:-} ]] && echo "/ $TOOLS_NEW_PASS   ← shown once" || echo "(reset with: srv tools password)")" \
+    "Allowed IPs" "$(x=$(cfg_get TOOLS_ALLOW); echo "${x:-any}")" \
+    "Adminer" "$(x=$(cfg_get TOOLS_ADMINER); [[ -f $TOOLS_DIR/adminer.php ]] && echo "${x:-installed}" || echo "not installed")" \
+    "phpMyAdmin" "$(x=$(cfg_get TOOLS_PMA); [[ -d $TOOLS_DIR/phpmyadmin ]] && echo "${x:-installed}" || echo "not installed")"
+  echo
+  echo "  Then log in with a database user — sites' users work, or create an admin: srv tools db-user"
+  if [[ $(cfg_get TOOLS_HOST _) == _ && -z $(cfg_get TOOLS_ALLOW) ]]; then
+    warn "The tools are on plain HTTP and open to any IP — restrict them: srv tools allow \"<your IP>\""
+  elif [[ $(cfg_get TOOLS_HOST _) != _ && $(site_get "$(cfg_get TOOLS_HOST)" SSL) != yes ]]; then
+    warn "$(cfg_get TOOLS_HOST) has no HTTPS — passwords travel unencrypted. Run: srv ssl add $(cfg_get TOOLS_HOST)"
+  fi
+}
+
+tools_db_user() {   # create / reset an all-powerful DB login for the tools
+  local eng="" a pass u=srv_admin
+  for a in "$@"; do case $a in --pg|--pgsql|--postgres) eng=pgsql ;; --mysql|--mariadb) eng=mysql ;; esac; done
+  db_pick_engine "$eng"
+  ui_yesno "Create/reset the database superuser '$u' on $(eng_label "$DB_ENG")? It can read and change every database." yes || die "Cancelled."
+  pass=$(gen_password 24)
+  if [[ $DB_ENG == pgsql ]]; then
+    if pg_user_exists "$u"; then pg_run >>"$SRV_LOG" 2>&1 <<SQL || die "Failed — see $SRV_LOG"
+ALTER ROLE "$u" WITH LOGIN SUPERUSER PASSWORD '$pass';
+SQL
+    else pg_run >>"$SRV_LOG" 2>&1 <<SQL || die "Failed — see $SRV_LOG"
+CREATE ROLE "$u" WITH LOGIN SUPERUSER PASSWORD '$pass';
+SQL
+    fi
+  else
+    db_run >>"$SRV_LOG" 2>&1 <<SQL || die "Failed — see $SRV_LOG"
+CREATE USER IF NOT EXISTS '$u'@'localhost' IDENTIFIED BY '$pass';
+ALTER USER '$u'@'localhost' IDENTIFIED BY '$pass';
+GRANT ALL PRIVILEGES ON *.* TO '$u'@'localhost' WITH GRANT OPTION;
+FLUSH PRIVILEGES;
+SQL
+  fi
+  ok "$(eng_label "$DB_ENG") login for the tools: $u / $pass   (server: localhost)"
+}
+
+tools_remove() {
+  feat_has dbadmin || die "The database tools aren't installed."
+  if (( ! ASSUME_YES )); then ui_yesno "Remove Adminer / phpMyAdmin from this server?" no || die "Cancelled."; fi
+  local php; php=$(cfg_get TOOLS_PHP)
+  rm -f "$TOOLS_CONF" "$TOOLS_HTPASSWD" "/etc/php/$php/fpm/pool.d/srv-tools.conf"
+  rm -rf "${TOOLS_WEB:?}" "${TOOLS_DIR:?}"
+  kv_del "$SRV_STATE" dbadmin
+  local h; h=$(cfg_get TOOLS_HOST _)
+  if [[ $h == _ ]]; then nginx_write_default && nginx_reload || true; elif site_exists "$h"; then site_apply_nginx "$h" || true; fi
+  run systemctl reload "php$php-fpm" || true
+  ok "Database tools removed (the srv_admin database login, if any, still exists)"
+}
+
+cmd_tools() {
+  local sub=${1:-status}; shift || true
+  case $sub in
+    status|show|info) tools_show ;;
+    install)
+      local t="" file=""
+      while (( $# )); do
+        case $1 in
+          adminer|phpmyadmin|both) t=$1; shift ;;
+          --file) need_val "$@"; file=$2; shift 2 ;;
+          --host) need_val "$@"; OPT_TOOLS_HOST=$2; shift 2 ;;
+          --allow) need_val "$@"; OPT_TOOLS_ALLOW=$2; shift 2 ;;
+          *) die "Usage: srv tools install [adminer|phpmyadmin|both] [--host <domain|_>] [--allow \"ips\"] [--file pma.tar.gz]" ;;
+        esac
+      done
+      if [[ -n $t ]]; then OPT_TOOLS=$t; fi   # installs just that tool; an installed other one stays
+      OPT_TOOLS_FILE=$file
+      if [[ -n $OPT_TOOLS_HOST && $OPT_TOOLS_HOST != _ ]]; then site_exists "$OPT_TOOLS_HOST" || die "Site not found: $OPT_TOOLS_HOST"; fi
+      if ! feat_has dbadmin; then ask_dbadmin; fi
+      if ! feat_has base; then try mod_base; fi
+      try mod_dbadmin
+      (( TRY_RC == 0 )) || die "Installing the database tools failed — see $SRV_LOG" ;;
+    update)
+      feat_has dbadmin || die "The database tools aren't installed."
+      if [[ -f $TOOLS_DIR/adminer.php ]]; then tools_install_adminer || warn "Adminer update failed"; fi
+      if [[ -d $TOOLS_DIR/phpmyadmin ]]; then tools_install_pma "${1:-}" || warn "phpMyAdmin update failed"; fi
+      tools_render && tools_apply_host ;;
+    password|passwd)
+      feat_has dbadmin || die "The database tools aren't installed."
+      if [[ -n ${1:-} ]]; then [[ $1 =~ ^[A-Za-z0-9._-]{1,32}$ ]] || die "Invalid user name"; cfg_set TOOLS_USER "$1"; fi
+      tools_set_password || die "Couldn't set the password"
+      ok "New login for the database tools: $(cfg_get TOOLS_USER admin) / $TOOLS_NEW_PASS" ;;
+    allow)
+      feat_has dbadmin || die "The database tools aren't installed."
+      local iplist=${1-}; if [[ $iplist == off || $iplist == any ]]; then iplist=""; fi
+      local ip; for ip in $iplist; do [[ $ip =~ ^[0-9A-Fa-f:./]+$ ]] || die "Invalid IP or range: $ip"; done
+      cfg_set TOOLS_ALLOW "$iplist"
+      tools_render && tools_apply_host
+      ok "Database tools allowed from: ${iplist:-any IP}" ;;
+    host)
+      feat_has dbadmin || die "The database tools aren't installed."
+      local h=${1:-}; [[ -n $h ]] || die "Usage: srv tools host <domain|_>"
+      if [[ $h != _ ]]; then site_exists "$h" || die "Site not found: $h"; fi
+      local old; old=$(cfg_get TOOLS_HOST _)
+      cfg_set TOOLS_HOST "$h"
+      if [[ $old == _ ]]; then nginx_write_default && nginx_reload; elif site_exists "$old"; then site_apply_nginx "$old"; fi
+      tools_apply_host
+      feat_set dbadmin "$(feat_get dbadmin | sed 's/ on .*//') on $h"
+      ok "Database tools moved to $(tools_url)" ;;
+    db-user)  tools_db_user "$@" ;;
+    remove|uninstall) tools_remove ;;
+    *) die "Usage: srv tools status|install|update|password|allow \"ips\"|host <domain>|db-user|remove" ;;
+  esac
+}
+
+# =============================================================================
+#  CHECKS, ALERTS, DASHBOARD
+# =============================================================================
+CHECK_RESULTS=()
+declare -A PROBE_CODE=() PROBE_MS=()
+chk() { CHECK_RESULTS+=("$1|$2|$3"); }   # level(ok|warn|fail|info) name detail
+
+human_age() {
+  local s=$1
+  if (( s < 120 )); then echo "${s}s"; elif (( s < 7200 )); then echo "$(( s / 60 ))m"
+  elif (( s < 172800 )); then echo "$(( s / 3600 ))h"; else echo "$(( s / 86400 ))d"; fi
+}
+
+http_probe() {   # domain → "code seconds"
+  local d=$1 path; path=$(site_get "$d" DEPLOY_HEALTH_PATH /)
+  if [[ $(site_get "$d" SSL) == yes ]]; then
+    curl -s -o /dev/null -w '%{http_code} %{time_total}' -k --noproxy '*' --max-time 8 --resolve "$d:443:127.0.0.1" "https://$d$path" 2>/dev/null || true
+  else
+    curl -s -o /dev/null -w '%{http_code} %{time_total}' --noproxy '*' --max-time 8 -H "Host: $d" "http://127.0.0.1$path" 2>/dev/null || true
+  fi
+}
+
+probe_sites() {   # all enabled sites in parallel → PROBE_CODE / PROBE_MS
+  local d dir r code t
+  dir=$(mktemp -d "$TMP_DIR/probe.XXXXXX")
+  while IFS= read -r d; do
+    if [[ -n $d && $(site_get "$d" ENABLED yes) == yes ]]; then ( http_probe "$d" >"$dir/$d" ) & fi
+  done < <(site_list_domains)
+  wait
+  PROBE_CODE=(); PROBE_MS=()
+  for r in "$dir"/*; do
+    [[ -f $r ]] || continue
+    d=$(basename "$r"); read -r code t <"$r" || true
+    PROBE_CODE[$d]=${code:-000}
+    PROBE_MS[$d]=$(awk -v t="${t:-0}" 'BEGIN { printf "%d", t * 1000 }')
+  done
+}
+
+run_checks() {
+  CHECK_RESULTS=()
+  local p pct mounts avail cores load5 d s v days code st newest age home
+  # Disk (each filesystem once)
+  mounts=$(df -P / /var /var/www 2>/dev/null | awk 'NR > 1 {print $6}' | sort -u)
+  for p in $mounts; do
+    pct=$(df -P "$p" | awk 'NR == 2 {gsub("%", "", $5); print $5}')
+    if (( pct >= 95 )); then chk fail "disk $p" "$pct% used"
+    elif (( pct >= 85 )); then chk warn "disk $p" "$pct% used"
+    else chk ok "disk $p" "$pct% used"; fi
+  done
+  # Memory
+  avail=$(awk '/^MemTotal:/ {t=$2} /^MemAvailable:/ {a=$2} END {printf "%d", a * 100 / t}' /proc/meminfo)
+  if (( avail < 5 )); then chk fail memory "only $avail% available"
+  elif (( avail < 10 )); then chk warn memory "only $avail% available"
+  else chk ok memory "$avail% available"; fi
+  # Load
+  cores=$(nproc 2>/dev/null || echo 1); load5=$(cut -d' ' -f2 /proc/loadavg)
+  if awk -v l="$load5" -v c="$cores" 'BEGIN { exit !(l > c * 2) }'; then chk warn load "5-min load $load5 on $cores CPU(s)"
+  else chk ok load "5-min load $load5 on $cores CPU(s)"; fi
+  # Services
+  local -a svcs=()
+  if feat_has nginx; then svcs+=(nginx); fi
+  for v in $(php_versions); do svcs+=("php$v-fpm"); done
+  if feat_has database; then svcs+=("$( [[ $(cfg_get DB_ENGINE) == mysql ]] && echo mysql || echo mariadb )"); fi
+  if feat_has postgres; then svcs+=("postgresql@$(cfg_get PG_VERSION)-main"); fi
+  if feat_has redis; then svcs+=(redis-server); fi
+  if feat_has supervisor; then svcs+=(supervisor); fi
+  if feat_has webhook; then svcs+=(srv-webhook); fi
+  if feat_has fail2ban; then svcs+=(fail2ban); fi
+  svcs+=(cron)
+  for s in "${svcs[@]}"; do
+    if [[ $(svc_state "$s") == active ]]; then chk ok "service $s" running; else chk fail "service $s" "$(svc_state "$s")"; fi
+  done
+  # Sites, certificates, apps, workers
+  probe_sites
+  while IFS= read -r d; do
+    [[ -n $d ]] || continue
+    home=$(site_get "$d" HOME_DIR)
+    if [[ $(site_get "$d" ENABLED yes) != yes ]]; then chk info "site $d" disabled; continue; fi
+    if [[ -f $home/.maintenance ]]; then chk info "site $d" "maintenance mode"
+    else
+      code=${PROBE_CODE[$d]:-000}
+      if [[ $code =~ ^[1-4][0-9][0-9]$ ]]; then chk ok "site $d" "HTTP $code in ${PROBE_MS[$d]:-?}ms"
+      else chk fail "site $d" "HTTP ${code/000/no response}"; fi
+    fi
+    if [[ $(site_get "$d" SSL) == yes ]]; then
+      if days=$(cert_days_left "$d"); then
+        if (( days < 3 )); then chk fail "cert $d" "expires in $days days"
+        elif (( days < 14 )); then chk warn "cert $d" "expires in $days days (renewal should have happened — check: srv ssl renew-test)"
+        else chk ok "cert $d" "$days days left"; fi
+      else chk fail "cert $d" "certificate missing"; fi
+    fi
+    if is_app_type "$(site_get "$d" TYPE)" && [[ $(site_get "$d" APP_ACTIVE) == yes ]]; then
+      st=$(pm_state "$d")
+      if [[ $st == running ]] && port_in_use "$(site_get "$d" PORT)"; then chk ok "app $d" "running ($(app_pm "$d"))"
+      else chk fail "app $d" "$st, port $(site_get "$d" PORT) $(port_in_use "$(site_get "$d" PORT)" && echo open || echo closed)"; fi
+    fi
+    if [[ -f $(laravel_conf "$d") ]]; then
+      st=$(laravel_state "$d")
+      if [[ $st =~ ^([0-9]+)/([0-9]+)\ running$ && ${BASH_REMATCH[1]} == "${BASH_REMATCH[2]}" ]]; then chk ok "workers $d" "$st"
+      else chk warn "workers $d" "$st"; fi
+    fi
+  done < <(site_list_domains)
+  # Backups
+  if feat_has backup; then
+    newest=$(find "$BACKUP_DIR" -type f -name '*.gz' ! -name '*before-restore*' -printf '%T@\n' 2>/dev/null | sort -n | tail -n 1 | cut -d. -f1)
+    if [[ -z $newest ]]; then chk warn backups "no backups yet"
+    else
+      age=$(( $(date +%s) - newest ))
+      if (( age > 93600 )); then chk warn backups "newest is $(human_age "$age") old"; else chk ok backups "newest is $(human_age "$age") old"; fi
+    fi
+  fi
+  if [[ -f /var/run/reboot-required ]]; then chk warn reboot "a reboot is required to finish updates"; fi
+}
+
+check_counts() {   # → "fails warns"
+  local r f=0 w=0
+  for r in "${CHECK_RESULTS[@]}"; do case ${r%%|*} in fail) f=$(( f + 1 )) ;; warn) w=$(( w + 1 )) ;; esac; done
+  echo "$f $w"
+}
+
+cmd_check() {
+  local notify=0 quiet=0 a r lvl name detail icon f w
+  for a in "$@"; do case $a in --notify) notify=1 ;; --quiet|-q) quiet=1 ;; *) die "Usage: srv check [--notify] [--quiet]" ;; esac; done
+  run_checks
+  read -r f w < <(check_counts)
+  if (( ! quiet )); then
+    for r in "${CHECK_RESULTS[@]}"; do
+      IFS='|' read -r lvl name detail <<<"$r"
+      case $lvl in
+        ok)   icon="$C_G✓$C_0" ;;
+        warn) icon="$C_Y!$C_0" ;;
+        fail) icon="$C_R✗$C_0" ;;
+        *)    icon="$C_D·$C_0" ;;
+      esac
+      printf ' %s %-40s %s\n' "$icon" "$name" "$detail"
+    done
+    echo
+    if (( f + w == 0 )); then ok "All ${#CHECK_RESULTS[@]} checks passed"; else warn "$f failing, $w warning"; fi
+  fi
+  if (( notify )); then notify_changes; fi
+  if (( f )); then return 2; fi
+  if (( w )); then return 1; fi
+  return 0
+}
+
+# ── Notifications (Telegram, Slack, Discord, any webhook) ────────────────────
+json_escape() {
+  local s=$1
+  s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\n'/\\n}; s=${s//$'\r'/}; s=${s//$'\t'/\\t}
+  printf '%s' "$s"
+}
+
+notify_send() {   # message — returns non-zero if delivery failed
+  local t msg; t=$(cfg_get NOTIFY_TYPE)
+  [[ -n $t ]] || return 0
+  msg="[$(hostname)] $1"
+  log "NOTIFY $t: ${1%%$'\n'*}"
+  case $t in
+    telegram)
+      printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$(cfg_get NOTIFY_TOKEN)" \
+        | curl -fsS --max-time 15 -K - --data-urlencode "chat_id=$(cfg_get NOTIFY_CHAT)" --data-urlencode "text=$msg" -o /dev/null 2>>"$SRV_LOG" ;;
+    discord)
+      printf 'url = "%s"\n' "$(cfg_get NOTIFY_URL)" | curl -fsS --max-time 15 -K - -H 'Content-Type: application/json' \
+        --data "{\"content\": \"$(json_escape "$msg")\"}" -o /dev/null 2>>"$SRV_LOG" ;;
+    slack|webhook)
+      printf 'url = "%s"\n' "$(cfg_get NOTIFY_URL)" | curl -fsS --max-time 15 -K - -H 'Content-Type: application/json' \
+        --data "{\"text\": \"$(json_escape "$msg")\", \"host\": \"$(hostname)\"}" -o /dev/null 2>>"$SRV_LOG" ;;
+    *) return 0 ;;
+  esac
+}
+
+# Alert only when something changes (new problem, or recovered)
+notify_changes() {
+  local state=/var/lib/srv/check.state r lvl name detail key prev
+  local -A old=()
+  local -a lines=()
+  install -d -m 755 /var/lib/srv
+  if [[ -f $state ]]; then
+    while IFS='=' read -r key lvl; do if [[ -n $key ]]; then old[$key]=$lvl; fi; done <"$state"
+  fi
+  : >"$state.new"
+  for r in "${CHECK_RESULTS[@]}"; do
+    IFS='|' read -r lvl name detail <<<"$r"
+    [[ $lvl == info ]] && lvl=ok
+    key=${name//[^A-Za-z0-9]/_}
+    prev=${old[$key]:-ok}
+    if [[ $lvl != "$prev" ]]; then
+      if [[ $lvl == ok ]]; then lines+=("✅ $name recovered — $detail")
+      elif [[ $lvl == fail ]]; then lines+=("❌ $name — $detail")
+      else lines+=("⚠️ $name — $detail"); fi
+    fi
+    echo "$key=$lvl" >>"$state.new"
+  done
+  mv -f "$state.new" "$state"
+  if (( ${#lines[@]} )); then
+    notify_send "$(printf '%s\n' "${lines[@]}")" || warn "Couldn't send the alert — see $SRV_LOG"
+  fi
+}
+
+notify_setup() {
+  local t="" token="" chat="" url=""
+  while (( $# )); do
+    case $1 in
+      --telegram) need_val "$@"; t=telegram; token=$2; shift 2 ;;
+      --chat)     need_val "$@"; chat=$2; shift 2 ;;
+      --slack|--discord|--webhook) need_val "$@"; t=${1#--}; url=$2; shift 2 ;;
+      *) die "Usage: srv notify setup [--telegram <bot token> --chat <id> | --slack <url> | --discord <url> | --webhook <url>]" ;;
+    esac
+  done
+  if [[ -z $t ]]; then
+    t=$(ui_menu "Alerts" "Send alerts to:" \
+      telegram "Telegram (a bot from @BotFather)" \
+      slack    "Slack (incoming webhook URL)" \
+      discord  "Discord (channel webhook URL)" \
+      webhook  "Any URL — POST JSON {\"text\": …}") || die "Cancelled."
+  fi
+  case $t in
+    telegram)
+      if [[ -z $token ]]; then token=$(ui_input "Bot token from @BotFather (looks like 123456:ABC…)" "") || die "Cancelled."; fi
+      [[ $token =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || die "That doesn't look like a bot token."
+      if [[ -z $chat ]]; then
+        info "Send any message to your bot now, then continue — srv will look up your chat id."
+        if (( INTERACTIVE )); then read -r -p "Press Enter after you've messaged the bot… " _ </dev/tty || true; fi
+        chat=$(printf 'url = "https://api.telegram.org/bot%s/getUpdates"\n' "$token" | curl -fsS --max-time 15 -K - 2>/dev/null \
+               | grep -oE '"chat":\{"id":-?[0-9]+' | tail -n 1 | grep -oE -- '-?[0-9]+$') || chat=""
+        if [[ -z $chat ]]; then chat=$(ui_input "Couldn't find it automatically — chat id" "") || die "Cancelled."; fi
+      fi
+      [[ $chat =~ ^-?[0-9]+$ ]] || die "The chat id must be a number."
+      cfg_set NOTIFY_TOKEN "$token"; cfg_set NOTIFY_CHAT "$chat"; cfg_set NOTIFY_URL "" ;;
+    slack|discord|webhook)
+      if [[ -z $url ]]; then url=$(ui_input "Webhook URL" "") || die "Cancelled."; fi
+      [[ $url =~ ^https?://[^[:space:]\"]+$ ]] || die "That doesn't look like a URL."
+      cfg_set NOTIFY_URL "$url"; cfg_set NOTIFY_TOKEN ""; cfg_set NOTIFY_CHAT "" ;;
+    *) die "Unknown channel: $t" ;;
+  esac
+  cfg_set NOTIFY_TYPE "$t"
+  if notify_send "srv alerts are set up ✅ You'll hear about failing services, sites, certificates, apps, backups and deploys."; then
+    ok "Test message sent via $t"
+  else
+    cfg_set NOTIFY_TYPE ""
+    die "Sending the test message failed — check the details (see $SRV_LOG). Alerts are off."
+  fi
+  self_install
+  cat >/etc/cron.d/srv-check <<EOF
+# Managed by srv — health checks every 5 minutes, alerts on changes
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/5 * * * * root $SRV_BIN check --notify --quiet >/dev/null 2>&1
+EOF
+  chmod 644 /etc/cron.d/srv-check
+  rm -f /var/lib/srv/check.state   # first run reports current problems
+  ok "Health checks run every 5 minutes; you get a message when something breaks or recovers"
+}
+
+cmd_notify() {
+  local sub=${1:-status}; shift || true
+  case $sub in
+    setup)  notify_setup "$@" ;;
+    test)   [[ -n $(cfg_get NOTIFY_TYPE) ]] || die "Alerts aren't set up — run: srv notify setup"
+            if notify_send "Test alert from srv ✅"; then ok "Sent"; else die "Sending failed — see $SRV_LOG"; fi ;;
+    off|disable) cfg_set NOTIFY_TYPE ""; rm -f /etc/cron.d/srv-check; ok "Alerts turned off" ;;
+    deploys) case ${1:-} in on|yes) cfg_set NOTIFY_DEPLOYS yes ;; off|no) cfg_set NOTIFY_DEPLOYS no ;; *) die "Usage: srv notify deploys on|off" ;; esac
+             ok "Deploy notifications: $(cfg_get NOTIFY_DEPLOYS)" ;;
+    status|"")
+      if [[ -n $(cfg_get NOTIFY_TYPE) ]]; then echo "Alerts: $(cfg_get NOTIFY_TYPE) · checks every 5 min · deploy messages: $(cfg_get NOTIFY_DEPLOYS yes)"
+      else echo "Alerts are off — set them up with: srv notify setup"; fi ;;
+    *) die "Usage: srv notify setup|test|off|deploys on|off" ;;
+  esac
+}
+
+# ── Dashboard ────────────────────────────────────────────────────────────────
+bar() {   # percent width → coloured bar
+  local p=$1 w=${2:-20} n c
+  (( p > 100 )) && p=100; (( p < 0 )) && p=0
+  n=$(( p * w / 100 )); c=$C_G
+  if (( p >= 90 )); then c=$C_R; elif (( p >= 75 )); then c=$C_Y; fi
+  printf '%s%s%s%s' "$c" "$(printf '%*s' "$n" '' | tr ' ' '#')" "$C_D$(printf '%*s' $(( w - n )) '' | tr ' ' '.')" "$C_0"
+}
+
+dashboard_render() {
+  local cores l1 memt mema memp swt swu p pct d type code ms ssl days proc mem dep cur meta r lvl name detail n=0 cols
+  cols=$(tput cols 2>/dev/null || echo 100)
+  cores=$(nproc 2>/dev/null || echo 1); l1=$(cut -d' ' -f1 /proc/loadavg)
+  read -r memt mema swt swu < <(awk '/^MemTotal:/ {t=$2} /^MemAvailable:/ {a=$2} /^SwapTotal:/ {st=$2} /^SwapFree:/ {sf=$2} END {print int(t/1024), int(a/1024), int(st/1024), int((st-sf)/1024)}' /proc/meminfo)
+  memp=$(( (memt - mema) * 100 / (memt > 0 ? memt : 1) ))
+  printf '%s srv dashboard — %s — %s %s(q quits)%s\n' "$C_BOLD" "$(hostname)" "$(date '+%F %T')" "$C_D" "$C_0"
+  hr
+  printf '  %-6s %s %5s  load %s on %s CPU\n' CPU "$(bar "$(awk -v l="$l1" -v c="$cores" 'BEGIN { printf "%d", l * 100 / c }')")" "" "$l1" "$cores"
+  printf '  %-6s %s %4s%%  %s / %s MB\n' Memory "$(bar "$memp")" "$memp" "$(( memt - mema ))" "$memt"
+  if (( swt > 0 )); then printf '  %-6s %s %4s%%  %s / %s MB\n' Swap "$(bar $(( swu * 100 / swt )))" "$(( swu * 100 / swt ))" "$swu" "$swt"; fi
+  for p in $(df -P / /var /var/www 2>/dev/null | awk 'NR > 1 {print $6}' | sort -u); do
+    pct=$(df -P "$p" | awk 'NR == 2 {gsub("%", "", $5); print $5}')
+    printf '  %-6s %s %4s%%  %s\n' Disk "$(bar "$pct")" "$pct" "$p ($(df -h "$p" | awk 'NR == 2 {print $3 " / " $2}'))"
+  done
+  echo
+  printf '%s  Services%s  ' "$C_BOLD" "$C_0"
+  for r in "${CHECK_RESULTS[@]}"; do
+    IFS='|' read -r lvl name detail <<<"$r"
+    [[ $name == service\ * ]] || continue
+    if [[ $lvl == ok ]]; then printf '%s●%s %s  ' "$C_G" "$C_0" "${name#service }"; else printf '%s●%s %s  ' "$C_R" "$C_0" "${name#service }"; fi
+  done
+  echo; echo
+  printf '%s  %-30s %-8s %-6s %-7s %-6s %-13s %-7s %s%s\n' "$C_BOLD" SITE TYPE HTTP TIME SSL PROCESS MEMORY "LAST DEPLOY" "$C_0"
+  while IFS= read -r d; do
+    [[ -n $d ]] || continue
+    n=$(( n + 1 )); type=$(site_get "$d" TYPE)
+    code=${PROBE_CODE[$d]:--}; ms=${PROBE_MS[$d]:-}
+    if [[ -f $(site_get "$d" HOME_DIR)/.maintenance ]]; then code=maint; fi
+    if [[ $(site_get "$d" ENABLED yes) != yes ]]; then code=off; fi
+    ssl=-; if [[ $(site_get "$d" SSL) == yes ]]; then if days=$(cert_days_left "$d"); then ssl="${days}d"; else ssl=missing; fi; fi
+    proc=-
+    if is_app_type "$type"; then proc=$(pm_state "$d"); elif [[ -f $(laravel_conf "$d") ]]; then proc=$(laravel_state "$d" | sed 's/ running//'); fi
+    mem="$(user_rss_mb "$(site_get "$d" SITE_USER)")M"
+    dep=-
+    if deploy_enabled "$d" && cur=$(deploy_current "$d"); then
+      meta=$(deploy_meta "$d" "$cur")
+      dep="$(kv_get "$meta" COMMIT | cut -c1-7) $(human_age $(( $(date +%s) - $(date -d "$(kv_get "$meta" DATE)" +%s 2>/dev/null || date +%s) ))) ago"
+    fi
+    local cc=$C_G; if [[ ! $code =~ ^[1-4] ]]; then cc=$C_R; fi; if [[ $code == maint || $code == off ]]; then cc=$C_Y; fi
+    printf '  %-30s %-8s %s%-6s%s %-7s %-6s %-13s %-7s %s\n' "${d:0:30}" "$type" "$cc" "$code" "$C_0" "${ms:+${ms}ms}" "$ssl" "$proc" "$mem" "$dep"
+  done < <(site_list_domains)
+  if (( n == 0 )); then echo "  (no sites yet)"; fi
+  echo
+  local alerts=0
+  printf '%s  Alerts%s\n' "$C_BOLD" "$C_0"
+  for r in "${CHECK_RESULTS[@]}"; do
+    IFS='|' read -r lvl name detail <<<"$r"
+    case $lvl in
+      fail) alerts=1; printf '  %s✗ %s%s — %s\n' "$C_R" "$name" "$C_0" "$detail" ;;
+      warn) alerts=1; printf '  %s! %s%s — %s\n' "$C_Y" "$name" "$C_0" "$detail" ;;
+    esac
+  done
+  if (( ! alerts )); then printf '  %s✓ all %s checks passing%s\n' "$C_G" "${#CHECK_RESULTS[@]}" "$C_0"; fi
+  local bl="off"
+  if feat_has backup; then bl="$(feat_get backup)$( [[ -n $(cfg_get BACKUP_REMOTE) ]] && echo " → $(cfg_get BACKUP_REMOTE)")"; fi
+  printf '\n  %sBackups: %s · Alerts: %s%s\n' "$C_D" "$bl" "$(x=$(cfg_get NOTIFY_TYPE); echo "${x:-off}")" "$C_0"
+  : "$cols"
+}
+
+cmd_dashboard() {
+  local interval=5 once=0 key
+  while (( $# )); do
+    case $1 in
+      --interval|-n) need_val "$@"; interval=$2; shift 2 ;;
+      --once) once=1; shift ;;
+      *) die "Usage: srv dashboard [--interval seconds] [--once]" ;;
+    esac
+  done
+  [[ $interval =~ ^[0-9]+$ ]] && (( interval >= 2 )) || die "The interval must be 2 seconds or more."
+  if (( ! INTERACTIVE )); then once=1; fi
+  if (( ! once )); then tput civis 2>/dev/null || true; trap 'tput cnorm 2>/dev/null || true' RETURN; fi
+  while true; do
+    run_checks
+    if (( ! once )); then printf '\e[H\e[2J'; fi
+    dashboard_render
+    if (( once )); then break; fi
+    key=""
+    read -rsn1 -t "$interval" key </dev/tty || true
+    if [[ $key == q || $key == Q ]]; then break; fi
+  done
+}
+
+# ── Self-update ──────────────────────────────────────────────────────────────
+self_update() {
+  local src=${1:-$(cfg_get UPDATE_URL)} f="$TMP_DIR/srv-new.sh" new
+  [[ -n $src ]] || die "Usage: srv self-update <URL or path of the new srv.sh>  (a URL is remembered for next time)"
+  if [[ $src =~ ^https?:// ]]; then
+    info "Downloading $src"
+    run curl -fsSL -o "$f" "$src" || die "Download failed"
+  else
+    [[ -f $src ]] || die "Not found: $src"
+    cp "$src" "$f"
+  fi
+  grep -q '^SRV_VERSION=' "$f" || die "That file isn't srv."
+  bash -n "$f" 2>>"$SRV_LOG" || die "The new file has syntax errors — not installing it."
+  new=$(sed -n 's/^SRV_VERSION="\(.*\)"$/\1/p' "$f" | head -n 1)
+  if [[ -f $SRV_BIN ]] && cmp -s "$f" "$SRV_BIN"; then ok "Already up to date ($new)"; return 0; fi
+  if [[ -f $SRV_BIN ]]; then cp -a "$SRV_BIN" "$SRV_BIN.bak-$SRV_VERSION"; fi
+  install -m 0755 "$f" "$SRV_BIN"
+  if [[ $src =~ ^https?:// ]]; then cfg_set UPDATE_URL "$src"; fi
+  ok "srv updated: $SRV_VERSION → ${new:-?} (previous copy: $SRV_BIN.bak-$SRV_VERSION)"
+  info "Apply the new config templates with: srv site rebuild --all"
 }
 
 # =============================================================================
@@ -4787,7 +5968,11 @@ backup_run() {
   if [[ -n $(db_engines) ]]; then try backup_db --all; if (( TRY_RC != 0 )); then failed=1; fi; fi
   if [[ $(cfg_get BACKUP_FILES no) == yes ]]; then try backup_site --all; if (( TRY_RC != 0 )); then failed=1; fi; fi
   if [[ -n $(cfg_get BACKUP_REMOTE) ]]; then try remote_push; if (( TRY_RC != 0 )); then failed=1; fi; fi
-  if (( failed )); then err "Backup run finished with errors — see $SRV_LOG"; return 1; fi
+  if (( failed )); then
+    err "Backup run finished with errors — see $SRV_LOG"
+    notify_send "❌ Backup run failed — see $SRV_LOG" || true
+    return 1
+  fi
   ok "Backup run finished"
 }
 
@@ -4936,6 +6121,12 @@ backup_restore_site() {
                DEPLOY_COMPOSER DEPLOY_NPM DEPLOY_OPTIMIZE DEPLOY_HEALTH_PATH DEPLOY_AUTO_ROLLBACK; do
         if grep -qE "^$k=" "$tmpd/srv-site.conf"; then site_set "$d" "$k" "$(kv_get "$tmpd/srv-site.conf" "$k")"; fi
       done
+      # Keep auto-deploy working: same webhook secret as configured in the git host
+      if [[ $(kv_get "$tmpd/srv-site.conf" DEPLOY_WEBHOOK) == yes ]]; then
+        site_set "$d" WEBHOOK_SECRET "$(kv_get "$tmpd/srv-site.conf" WEBHOOK_SECRET)"
+        if feat_has webhook; then site_set "$d" DEPLOY_WEBHOOK yes; webhook_write_secret "$d"
+        else warn "This site auto-deployed via webhook — turn it back on with: srv deploy webhook $d on (same secret)"; fi
+      fi
     fi
     deploy_ensure_dirs "$d"
     if [[ -f $tmpd/srv-release.meta ]]; then cp "$tmpd/srv-release.meta" "$(deploy_meta "$d" "$arel")"
@@ -5180,6 +6371,8 @@ cmd_status() {
     else printf '  %-13s %s%s%s\n' "$f" "$C_D" "not installed" "$C_0"; fi
   done
   if [[ -n $(cfg_get BACKUP_REMOTE) ]]; then printf '  %-13s %s\n' "  remote" "$(cfg_get BACKUP_REMOTE) (kept $(cfg_get BACKUP_REMOTE_KEEP 30) days)"; fi
+  if feat_has dbadmin; then printf '  %-13s %s\n' "  tools URL" "$(tools_url)"; fi
+  printf '  %-13s %s\n' "alerts" "$(x=$(cfg_get NOTIFY_TYPE); echo "${x:-off} (srv notify setup · health check: srv check)")"
 
   echo; printf '%sServices%s\n' "$C_BOLD" "$C_0"
   if feat_has nginx; then svc_row nginx; fi
@@ -5222,6 +6415,10 @@ main_menu() {
       sites   "Sites — add, list, SSL, logs, remove …" \
       apps    "Apps — Node.js / Python processes, Laravel workers" \
       deploy  "Deploy — git releases, rollback, webhooks" \
+      dashboard "Live dashboard" \
+      check   "Health check & alerts" \
+      runtimes "PHP / Node.js / Python versions" \
+      tools   "Database tools (Adminer / phpMyAdmin)" \
       ssl     "SSL certificates" \
       db      "Databases (MySQL/MariaDB, PostgreSQL)" \
       backup  "Backups" \
@@ -5234,6 +6431,10 @@ main_menu() {
       sites)   try menu_sites; continue ;;
       apps)    try menu_apps; continue ;;
       deploy)  try menu_deploy; continue ;;
+      dashboard) try cmd_dashboard; continue ;;
+      check)   try menu_check; continue ;;
+      runtimes) try menu_runtimes; continue ;;
+      tools)   try menu_tools; continue ;;
       ssl)     try menu_ssl; continue ;;
       db)      try menu_db; continue ;;
       backup)  try menu_backup; continue ;;
@@ -5256,6 +6457,7 @@ menu_sites() {
       logs      "View recent logs" \
       workers   "Laravel queue workers / Horizon / Reverb" \
       maintenance "Maintenance mode on/off" \
+      cron      "Cron jobs for a site" \
       redis     "Turn Redis on/off for a site" \
       fix-perms "Fix ownership & permissions" \
       apply-env "Write DB / Redis credentials into .env" \
@@ -5268,6 +6470,12 @@ menu_sites() {
       back) return 0 ;;
       list) site_list ;;
       ssl)  try cmd_ssl add ;;
+      cron)
+        if d=$(pick_site); then
+          try cron_list "$d"
+          k=$(ui_menu "Cron: $d" "Cron jobs:" add "Add a job" remove "Remove a job" back "Back") || continue
+          case $k in add) try cron_add "$d" ;; remove) try cron_remove "$d" ;; esac
+        fi ;;
       logs)
         if d=$(pick_site); then
           k=$(ui_menu "Logs: $d" "Which log?" error "Nginx error log" access "Nginx access log" \
@@ -5365,6 +6573,90 @@ menu_deploy() {
   done
 }
 
+menu_check() {
+  local c
+  while true; do
+    c=$(ui_menu "Health & alerts" "$(x=$(cfg_get NOTIFY_TYPE); echo "Alerts: ${x:-off}")" \
+      check  "Run all health checks now" \
+      setup  "Set up alerts (Telegram, Slack, Discord, webhook)" \
+      test   "Send a test alert" \
+      off    "Turn alerts off" \
+      back   "Back") || return 0
+    case $c in
+      back)  return 0 ;;
+      check) try cmd_check ;;
+      *)     try cmd_notify "$c" ;;
+    esac
+    pause
+  done
+}
+
+menu_runtimes() {
+  local c v
+  while true; do
+    c=$(ui_menu "Runtimes" "PHP, Node.js and Python versions:" \
+      php-list     "PHP: list versions" \
+      php-install  "PHP: install a version" \
+      php-default  "PHP: set the default" \
+      php-ext      "PHP: add an extension" \
+      php-remove   "PHP: remove a version" \
+      node-list    "Node.js: list versions" \
+      node-install "Node.js: install a version" \
+      node-default "Node.js: set the default" \
+      node-upgrade "Node.js: upgrade a version to its newest release" \
+      node-remove  "Node.js: remove a version" \
+      py-list      "Python: list versions" \
+      py-install   "Python: install a version" \
+      py-remove    "Python: remove a version" \
+      back         "Back") || return 0
+    case $c in
+      back)         return 0 ;;
+      php-list)     php_cmd_list ;;
+      php-install)  try cmd_install php ;;
+      node-list)    node_cmd_list ;;
+      node-install) try cmd_install node ;;
+      py-list)      py_cmd_list ;;
+      php-ext)      if v=$(ui_input "Extension name (e.g. imagick, soap, imap)" ""); then try php_cmd_ext "$v" all; fi ;;
+      py-install)   if v=$(ui_input "Python version (e.g. 3.12)" ""); then try cmd_install python "$v"; fi ;;
+      *)
+        if v=$(ui_input "Version" ""); then
+          case $c in
+            php-default)  try php_cmd_default "$v" ;;
+            php-remove)   try php_cmd_remove "$v" ;;
+            node-default) try node_cmd_default "$v" ;;
+            node-upgrade) try node_cmd_upgrade "$v" ;;
+            node-remove)  try node_cmd_remove "$v" ;;
+            py-remove)    try py_cmd_remove "$v" ;;
+          esac
+        fi ;;
+    esac
+    pause
+  done
+}
+
+menu_tools() {
+  local c v
+  while true; do
+    c=$(ui_menu "Database tools" "$(feat_has dbadmin && tools_url || echo "Not installed")" \
+      status   "Show URL and login" \
+      install  "Install Adminer / phpMyAdmin" \
+      password "New login password" \
+      allow    "Restrict to IP addresses" \
+      host     "Serve under another site's domain" \
+      db-user  "Create an admin database login" \
+      update   "Update to the newest versions" \
+      remove   "Remove the tools" \
+      back     "Back") || return 0
+    case $c in
+      back)  return 0 ;;
+      allow) if v=$(ui_input "Allowed IPs/ranges, space-separated (blank = any)" "$(cfg_get TOOLS_ALLOW)" empty); then try cmd_tools allow "${v:-off}"; fi ;;
+      host)  if v=$(pick_site); then try cmd_tools host "$v"; fi ;;
+      *)     try cmd_tools "$c" ;;
+    esac
+    pause
+  done
+}
+
 menu_backup() {
   local c m
   while true; do
@@ -5419,9 +6711,10 @@ Sites
   site add [domain] --type static|spa|php|laravel|node|python|proxy  [options]
       common   --aliases "www.example.com"  --db|--no-db  --mysql|--pg  --redis|--no-redis  --ssl|--no-ssl
                --repo <git url> [--branch main]   deploy from git right away
+               --canonical|--no-canonical         redirect aliases (www) to the primary domain
       PHP      --php 8.4  --webroot public
       Node.js  --node 24  --preset next|nuxt|nest|generic  --start "npm start"  --build "npm run build"
-      Python   --framework django|flask|fastapi|other  --server gunicorn|uvicorn  --module main:app  --workers 3
+      Python   --framework django|flask|fastapi|other  --server gunicorn|uvicorn  --module main:app  --workers 3  --python 3.12
       apps     --pm systemd|pm2|supervisor  --port 3001  --websocket|--no-websocket
       proxy    --upstream 127.0.0.1:8080  --websocket|--no-websocket
   site list
@@ -5437,6 +6730,19 @@ Sites
   site rollback <domain> [release]
   site logs <domain> [error|access|php|laravel|app|queue|horizon|reverb|deploy]
   site remove <domain> [--purge]   --purge also deletes files, database and cert
+
+Runtimes
+  php list | install <v> | default <v> | remove <v> | ext <name> [v|all]
+  node list | install <major|lts> | default <major> | upgrade <major> | remove <major>
+  python list | install <3.x> | remove <3.x>        per site: srv site set <domain> PY_VERSION 3.12
+
+Admin
+  dashboard [--interval 5]     Live view: resources, services, sites, apps, alerts
+  check [--notify] [--quiet]   Health checks (exit code 0 ok, 1 warnings, 2 failures)
+  notify setup|test|off|deploys on|off   Alerts via Telegram, Slack, Discord or a webhook
+  tools [status|install [adminer|phpmyadmin]|password|allow "ips"|host <domain>|db-user|update|remove]
+  cron <domain> list | add "<schedule>" "<command>" | remove <n> | run <n>
+  self-update [URL|file]       Replace srv with a newer version (checked before installing)
 
 Deploy (git)
   deploy setup <domain> [--repo URL] [--branch main] [--keep 5] [--no-deploy]
@@ -5532,7 +6838,18 @@ main() {
       case ${1:-} in list|ls) ;; run) acquire_lock 3600 ;; *) acquire_lock ;; esac
       cmd_backup "$@" ;;
     status)  cmd_status ;;
+    check)   cmd_check "$@" ;;
+    dashboard|top) cmd_dashboard "$@" ;;
+    notify|alerts)
+      case ${1:-} in status|"") ;; *) acquire_lock ;; esac
+      cmd_notify "$@" ;;
+    php)     case ${1:-list} in list|ls) ;; *) acquire_lock ;; esac; cmd_php "$@" ;;
+    node)    case ${1:-list} in list|ls) ;; *) acquire_lock ;; esac; cmd_node "$@" ;;
+    python)  case ${1:-list} in list|ls) ;; *) acquire_lock ;; esac; cmd_python "$@" ;;
+    tools)   case ${1:-status} in status|show|info) ;; *) acquire_lock ;; esac; cmd_tools "$@" ;;
+    cron)    case ${2:-list} in list|ls) ;; *) acquire_lock ;; esac; cmd_cron "$@" ;;
     self-install) self_install ;;
+    self-update)  acquire_lock; self_update "${1:-}" ;;
     *) err "Unknown command: $cmd"; echo; usage; exit 1 ;;
   esac
 }
