@@ -39,13 +39,14 @@
 set -Eeuo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-SRV_VERSION="4.0.0"
+SRV_VERSION="4.0.1"
 SRV_DIR="/etc/srv"
 SRV_STATE="$SRV_DIR/installed.conf"     # installed features
 SRV_CFG="$SRV_DIR/srv.conf"             # global settings
 SRV_SITES="$SRV_DIR/sites"              # one <domain>.conf per site
 SRV_LOG="/var/log/srv.log"
 SRV_BIN="/usr/local/bin/srv"
+SRV_UPDATE_URL="https://raw.githubusercontent.com/arman-arif/srv-shell/main/srv.sh"   # srv self-update
 SRV_LIB="/opt/srv"                      # runtimes and app launchers
 SRV_RUN="$SRV_LIB/run"                  # <domain>.sh launchers, PM2 configs
 NODE_ROOT="$SRV_LIB/node"               # <major> -> versions/vX.Y.Z
@@ -5629,12 +5630,20 @@ cmd_dashboard() {
 }
 
 # ── Self-update ──────────────────────────────────────────────────────────────
-self_update() {
-  local src=${1:-$(cfg_get UPDATE_URL)} f="$TMP_DIR/srv-new.sh" new
-  [[ -n $src ]] || die "Usage: srv self-update <URL or path of the new srv.sh>  (a URL is remembered for next time)"
+self_update() {   # [URL|file] [--force]
+  local src="" force=0 a f="$TMP_DIR/srv-new.sh" new target bak url
+  for a in "$@"; do
+    case $a in
+      --force) force=1 ;;
+      -*)      die "Usage: srv self-update [URL or file] [--force]" ;;
+      *)       src=$a ;;
+    esac
+  done
+  src=${src:-$(cfg_get UPDATE_URL)}; src=${src:-$SRV_UPDATE_URL}
   if [[ $src =~ ^https?:// ]]; then
-    info "Downloading $src"
-    run curl -fsSL -o "$f" "$src" || die "Download failed"
+    info "Checking $src"
+    url=$src; if [[ $url != *\?* ]]; then url="$url?t=$(date +%s)"; fi   # skip stale CDN copies
+    run curl -fsSL --max-time 60 -H 'Cache-Control: no-cache' -o "$f" "$url" || die "Download failed — check the URL (or pass a file: srv self-update ./srv.sh)"
   else
     [[ -f $src ]] || die "Not found: $src"
     cp "$src" "$f"
@@ -5642,11 +5651,25 @@ self_update() {
   grep -q '^SRV_VERSION=' "$f" || die "That file isn't srv."
   bash -n "$f" 2>>"$SRV_LOG" || die "The new file has syntax errors — not installing it."
   new=$(sed -n 's/^SRV_VERSION="\(.*\)"$/\1/p' "$f" | head -n 1)
-  if [[ -f $SRV_BIN ]] && cmp -s "$f" "$SRV_BIN"; then ok "Already up to date ($new)"; return 0; fi
-  if [[ -f $SRV_BIN ]]; then cp -a "$SRV_BIN" "$SRV_BIN.bak-$SRV_VERSION"; fi
-  install -m 0755 "$f" "$SRV_BIN"
-  if [[ $src =~ ^https?:// ]]; then cfg_set UPDATE_URL "$src"; fi
-  ok "srv updated: $SRV_VERSION → ${new:-?} (previous copy: $SRV_BIN.bak-$SRV_VERSION)"
+  target=$(readlink -f "$SRV_BIN" 2>/dev/null) || target=$SRV_BIN
+  if [[ -f $target ]] && cmp -s "$f" "$target"; then ok "Already up to date (srv $SRV_VERSION)"; return 0; fi
+  if [[ -n $new ]] && ! ver_ge "$new" "$SRV_VERSION" && (( ! force )); then
+    die "That's an older version ($new, you have $SRV_VERSION) — add --force to install it anyway."
+  fi
+  if [[ -f $target ]]; then
+    bak="$SRV_BIN.bak-$SRV_VERSION"; if [[ -e $bak ]]; then bak="$bak-$(date +%Y%m%d%H%M%S)"; fi
+    cp -L "$SRV_BIN" "$bak"            # the old file's contents, even if srv is a symlink
+  fi
+  # Write a new file and rename it into place: atomic, replaces a symlink with a real
+  # file, and the srv process running right now keeps reading its old copy
+  install -m 0755 "$f" "$SRV_BIN.new.$$"
+  mv -f "$SRV_BIN.new.$$" "$SRV_BIN"
+  if [[ $src =~ ^https?:// && $src != "$SRV_UPDATE_URL" ]]; then cfg_set UPDATE_URL "$src"
+  elif [[ $src == "$SRV_UPDATE_URL" ]]; then cfg_set UPDATE_URL ""; fi
+  if [[ $new == "$SRV_VERSION" ]]; then ok "srv $new updated to the latest build"
+  else ok "srv updated: $SRV_VERSION → ${new:-?}"; fi
+  if [[ -n ${bak:-} ]]; then info "Previous version saved as $bak"; fi
+  if [[ $target != "$SRV_BIN" ]]; then info "$SRV_BIN was a link to $target — it's now a standalone copy, so $target is no longer used."; fi
   info "Apply the new config templates with: srv site rebuild --all"
 }
 
@@ -6770,7 +6793,8 @@ Admin
   notify setup|test|off|deploys on|off   Alerts via Telegram, Slack, Discord or a webhook
   tools [status|install [adminer|phpmyadmin]|password|allow "ips"|host <domain>|db-user|update|remove]
   cron <domain> list | add "<schedule>" "<command>" | remove <n> | run <n>
-  self-update [URL|file]       Replace srv with a newer version (checked before installing)
+  self-update [URL|file]       Update srv to the latest version from GitHub (or a given URL/file;
+                               syntax-checked first, previous version kept as a backup)
 
 Deploy (git)
   deploy setup <domain> [--repo URL] [--branch main] [--keep 5] [--no-deploy]
@@ -6877,7 +6901,7 @@ main() {
     tools)   case ${1:-status} in status|show|info) ;; *) acquire_lock ;; esac; cmd_tools "$@" ;;
     cron)    case ${2:-list} in list|ls) ;; *) acquire_lock ;; esac; cmd_cron "$@" ;;
     self-install) self_install ;;
-    self-update)  acquire_lock; self_update "${1:-}" ;;
+    self-update)  acquire_lock; self_update "$@" ;;
     *) err "Unknown command: $cmd"; echo; usage; exit 1 ;;
   esac
 }

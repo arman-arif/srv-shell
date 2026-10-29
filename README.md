@@ -193,9 +193,16 @@ boxes.
 ## Upgrading srv
 
 ```bash
-sudo srv self-update https://raw.githubusercontent.com/arman-arif/srv-shell/main/srv.sh
+sudo srv self-update               # latest version from this repository
 sudo srv site rebuild --all        # apply the new config templates
 ```
 
-The update is syntax-checked before it replaces anything, and the previous
-version is kept as `/usr/local/bin/srv.bak-<version>`.
+- **Checks first:** the update is syntax-checked before it replaces anything,
+  and the previous version is kept as `/usr/local/bin/srv.bak-<version>`.
+- **Older versions are refused** unless you add `--force`.
+- **Another source:** pass it as an argument, e.g. `sudo srv self-update
+  https://example.com/srv.sh` or `sudo srv self-update ./srv.sh`. A URL is
+  remembered for later plain `srv self-update` runs.
+
+Servers running srv 4.0.0 need the URL once, because that version has no
+default: `sudo srv self-update https://raw.githubusercontent.com/arman-arif/srv-shell/main/srv.sh`
