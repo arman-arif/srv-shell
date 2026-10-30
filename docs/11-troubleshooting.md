@@ -57,6 +57,22 @@ Nginx can't reach the app.
 - After changing its code without git: `srv service build <domain> <name>`.
 - On its own domain: DNS must point here, then `srv service ssl <domain> <name>`.
 
+## Laravel workers aren't running
+
+- `srv app status <domain>` shows e.g. `workers 0/2 running`; the reason is in
+  `srv site logs <domain> queue` (or `horizon`, `reverb`). Errors from earlier
+  attempts stay in the file, so look at the newest lines.
+- **`Could not open input file: …/artisan`**: the Laravel project isn't
+  directly in the site's code folder (`app/`, or `current/` with git). Put it
+  there, so `artisan` sits at the top of that folder.
+- **Workers that crashed repeatedly** (Supervisor shows `FATAL`) stay down even
+  after the cause is fixed. `srv app restart <domain>` starts them again.
+- Run the worker by hand to see its error directly:
+  `srv app exec <domain> 'php artisan queue:work --once -vvv'`.
+- Since srv 4.3.2, workers set up before the code exists wait, and start by
+  themselves once it arrives (on deploy, `srv site fix-perms` or
+  `srv app start`).
+
 ## 500 errors (PHP, Laravel)
 
 - `srv site logs <domain> php` (PHP-FPM) and `srv site logs <domain> laravel`.

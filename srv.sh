@@ -39,7 +39,7 @@
 set -Eeuo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-SRV_VERSION="4.3.1"
+SRV_VERSION="4.3.2"
 SRV_DIR="/etc/srv"
 SRV_STATE="$SRV_DIR/installed.conf"     # installed features
 SRV_CFG="$SRV_DIR/srv.conf"             # global settings
@@ -3174,6 +3174,7 @@ site_fix_perms() {
   local f
   for f in "$app/.env" "$home/shared/.env" "$home/app.env"; do if [[ -f $f ]]; then run chmod 600 "$f"; fi; done
   ok "Owner $user (read/write), Nginx read-only, others no access"
+  if [[ $(site_get "$d" TYPE) == laravel ]]; then laravel_workers_kick "$d"; fi
 }
 
 laravel_env_file() {   # where the site's .env lives
@@ -3765,10 +3766,25 @@ app_wait() {
 }
 
 laravel_ctl() {   # start|stop|restart the Laravel worker group
-  local d=$1 action=$2 user; user=$(site_get "$d" SITE_USER)
+  local d=$1 action=$2 user st; user=$(site_get "$d" SITE_USER)
   [[ -f $(laravel_conf "$d") ]] || die "$d has no workers configured — set them up with: srv site workers $d"
-  run supervisorctl "$action" "srv-$user-laravel:*" || die "supervisorctl $action failed — see $SRV_LOG"
-  ok "$d workers: $action done ($(laravel_state "$d"))"
+  if [[ $action == stop ]]; then
+    run supervisorctl stop "srv-$user-laravel:*" || die "supervisorctl stop failed — see $SRV_LOG"
+    ok "$d workers stopped"; return 0
+  fi
+  [[ -f $(site_get "$d" APP_DIR)/artisan ]] || die "$(site_get "$d" APP_DIR)/artisan doesn't exist — the Laravel project must be in that folder (upload or deploy it first)."
+  if grep -q '^autostart=false' "$(laravel_conf "$d")"; then laravel_render_workers "$d" >/dev/null 2>&1 || true; fi
+  laravel_start_group "$d"
+  st=$(laravel_state "$d")
+  if [[ $st =~ ^([0-9]+)/([0-9]+)\ running$ && ${BASH_REMATCH[1]} == "${BASH_REMATCH[2]}" ]]; then ok "$d workers: $st"
+  else warn "$d workers: $st — see why with: srv site logs $d queue (or horizon, reverb)"; return 1; fi
+}
+
+# (Re)start the group, including processes Supervisor gave up on (FATAL)
+laravel_start_group() {
+  local user; user=$(site_get "$1" SITE_USER)
+  supervisorctl stop "srv-$user-laravel:*" >>"$SRV_LOG" 2>&1 || true
+  supervisorctl start "srv-$user-laravel:*" >>"$SRV_LOG" 2>&1 || true
 }
 
 laravel_state() {
@@ -3939,8 +3955,8 @@ app_manager() {
 }
 
 # ── Laravel: queue workers, Horizon, Reverb (Supervisor) ─────────────────────
-sv_program() {   # name command log stopwait numprocs dir user home
-  local name=$1 cmd=$2 logf=$3 stopwait=$4 n=$5 dir=$6 user=$7 home=$8 pname='%(program_name)s'
+sv_program() {   # name command log stopwait numprocs dir user home [autostart]
+  local name=$1 cmd=$2 logf=$3 stopwait=$4 n=$5 dir=$6 user=$7 home=$8 auto=${9:-true} pname='%(program_name)s'
   if (( n > 1 )); then pname='%(program_name)s_%(process_num)02d'; fi
   cat <<EOF
 
@@ -3950,7 +3966,7 @@ directory=$dir
 user=$user
 numprocs=$n
 process_name=$pname
-autostart=true
+autostart=$auto
 autorestart=true
 startsecs=1
 startretries=10
@@ -3977,27 +3993,48 @@ laravel_render_workers() {
     return 0
   fi
   feat_has supervisor || { err "Supervisor isn't installed — run: srv install supervisor"; return 1; }
+  # No code yet (a new site, before the upload or first deploy): register the
+  # workers without starting them, so they don't crash-loop into FATAL. They
+  # start once artisan is there (deploy, srv site fix-perms, srv app start).
+  local auto=true
+  if [[ ! -f $app/artisan ]]; then
+    auto=false
+    warn "$app/artisan isn't there yet — the workers will start once the code is in place (or run: srv app start $d)"
+  fi
   local -a progs=()
   {
     echo "; Managed by srv — Laravel processes for $d (change with: srv site workers $d)"
     if [[ $h == yes ]]; then
       progs+=("srv-$user-horizon")
-      sv_program "srv-$user-horizon" "/usr/bin/php$php $app/artisan horizon" "$home/logs/horizon.log" 3600 1 "$app" "$user" "$home"
+      sv_program "srv-$user-horizon" "/usr/bin/php$php $app/artisan horizon" "$home/logs/horizon.log" 3600 1 "$app" "$user" "$home" "$auto"
     elif (( q > 0 )); then
       progs+=("srv-$user-queue")
       sv_program "srv-$user-queue" "/usr/bin/php$php $app/artisan queue:work --sleep=3 --tries=3 --max-time=3600" \
-        "$home/logs/queue.log" 3600 "$q" "$app" "$user" "$home"
+        "$home/logs/queue.log" 3600 "$q" "$app" "$user" "$home" "$auto"
     fi
     if [[ $r == yes ]]; then
       progs+=("srv-$user-reverb")
       sv_program "srv-$user-reverb" "/usr/bin/php$php $app/artisan reverb:start --host=127.0.0.1 --port=$rp" \
-        "$home/logs/reverb.log" 30 1 "$app" "$user" "$home"
+        "$home/logs/reverb.log" 30 1 "$app" "$user" "$home" "$auto"
     fi
     echo
     echo "[group:srv-$user-laravel]"
     echo "programs=$(IFS=,; echo "${progs[*]}")"
   } >"$conf"
   sv_update || return 1
+}
+
+# Start Laravel workers that aren't running (never started, stopped, or given up
+# after crash-looping) once the code is in place
+laravel_workers_kick() {
+  local d=$1 user st; user=$(site_get "$d" SITE_USER)
+  [[ -f $(laravel_conf "$d") && -f $(site_get "$d" APP_DIR)/artisan ]] || return 0
+  if grep -q '^autostart=false' "$(laravel_conf "$d")"; then laravel_render_workers "$d" >/dev/null 2>&1 || return 0; fi
+  st=$(laravel_state "$d")
+  if [[ $st =~ ^([0-9]+)/([0-9]+)\ running$ && ${BASH_REMATCH[1]} == "${BASH_REMATCH[2]}" ]]; then return 0; fi
+  supervisorctl start "srv-$user-laravel:*" >>"$SRV_LOG" 2>&1 || true
+  sleep 2
+  info "$d workers: $(laravel_state "$d")"
 }
 
 site_workers() {
@@ -5331,8 +5368,9 @@ deploy_reload() {
     php|laravel)
       run systemctl reload "php$(site_get "$d" PHP)-fpm" || warn "PHP-FPM reload failed"
       if [[ $type == laravel && -f $(laravel_conf "$d") ]]; then
-        if (( first )); then laravel_render_workers "$d" || warn "Worker config update failed"; fi
-        run supervisorctl restart "srv-$user-laravel:*" || warn "Restarting the Laravel workers failed"
+        if (( first )) || grep -q '^autostart=false' "$(laravel_conf "$d")"; then laravel_render_workers "$d" || warn "Worker config update failed"; fi
+        laravel_start_group "$d"
+        info "Laravel workers: $(laravel_state "$d")"
       fi ;;
     node|python)
       app_start "$d" ;;
