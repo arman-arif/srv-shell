@@ -39,7 +39,7 @@
 set -Eeuo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-SRV_VERSION="4.3.0"
+SRV_VERSION="4.3.1"
 SRV_DIR="/etc/srv"
 SRV_STATE="$SRV_DIR/installed.conf"     # installed features
 SRV_CFG="$SRV_DIR/srv.conf"             # global settings
@@ -3470,7 +3470,12 @@ app_path() {
   case $(site_get "$d" TYPE) in
     node)   printf '%s/%s/bin:%s' "$NODE_ROOT" "$(site_get "$d" NODE)" "$base" ;;
     python) printf '%s/bin:%s' "${venv:-$(app_venv "$d")}" "$base" ;;
-    *)      nb=$(node_default_bin); printf '%s%s' "${nb:+$nb:}" "$base" ;;   # PHP/static builds may need npm
+    php|laravel)   # 'php' = the site's own PHP version (also for composer, artisan, cron jobs)
+      local v pb; v=$(site_get "$d" PHP); pb="$SRV_LIB/php-bin/$v"; nb=$(node_default_bin)
+      if [[ -n $v && -x /usr/bin/php$v && ! -e $pb/php ]]; then mkdir -p "$pb" 2>/dev/null && ln -sfn "/usr/bin/php$v" "$pb/php" 2>/dev/null || true; fi
+      if [[ -e $pb/php ]]; then printf '%s:' "$pb"; fi
+      printf '%s%s' "${nb:+$nb:}" "$base" ;;
+    *)      nb=$(node_default_bin); printf '%s%s' "${nb:+$nb:}" "$base" ;;   # static builds may need npm
   esac
 }
 
@@ -3887,9 +3892,10 @@ app_build() {
 
 app_exec_cmd() {
   local d=${1:-} cmd=${2:-}
-  d=$(resolve_domain "$d" apps) || exit 1
-  is_app_type "$(site_get "$d" TYPE)" || die "exec is for Node.js and Python apps."
-  [[ -n $cmd ]] || die "Usage: srv app exec <domain> '<command>'   e.g. srv app exec $d 'python manage.py migrate'"
+  d=$(resolve_domain "$d") || exit 1
+  [[ $(site_get "$d" TYPE) != proxy ]] || die "$d is a proxy site — it has no code to run commands in."
+  [[ -n $cmd ]] || die "Usage: srv app exec <domain> '<command>'   e.g. srv app exec $d 'php artisan migrate'"
+  [[ -d $(site_get "$d" APP_DIR) ]] || die "$(site_get "$d" APP_DIR) doesn't exist yet — upload or deploy the code first."
   app_exec "$d" "$cmd"
 }
 
@@ -8135,7 +8141,7 @@ Apps (Node.js / Python processes, Laravel workers)
   app start|stop|restart <domain>
   app status <domain>
   app logs <domain> [type]
-  app exec <domain> '<cmd>'    Run a command as the app user (e.g. 'python manage.py migrate')
+  app exec <domain> '<cmd>'    Run a command as the site user in its code folder (e.g. 'php artisan migrate')
   app manager <domain> [systemd|pm2|supervisor]
 
 SSL
